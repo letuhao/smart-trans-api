@@ -1,0 +1,32 @@
+lmstudio:
+  base_url: "http://localhost:1234/v1"
+  model: "google/gemma-3-1b-it"
+  endpoint_type: "chat"  # "chat" or "completion" (LM Studio interface type)
+
+batch:
+  max_size: 4
+  max_chars: 4000
+
+cache:
+  persistent_file: "cache.json"
+
+default:
+  source_lang: "auto"
+  target_lang: "vi"
+
+prompts:
+  default: >
+    You are a professional translation engine. Translate the user message from
+    {source_lang_name} (language code: {source_lang_code}) to {target_lang_name}
+    (language code: {target_lang_code}). Rules: 1) Output only the translation,
+    no explanations. 2) Preserve meaning and tone. 3) Use vocabulary that is
+    natural to native speakers of {target_lang_name}.
+  zh-vi: >
+    You are a professional Chinese-to-Vietnamese literary translator. Translate
+    the user message from Chinese (language code: {source_lang_code}) to
+    Vietnamese (language code: {target_lang_code}). Rules: 1) Output only the
+    translation, no explanations or comments. 2) Prefer Sino-Vietnamese
+    (Hán-Việt) vocabulary to preserve a classical or formal tone when
+    appropriate. 3) Do not add or omit information compared to the source. 4)
+    Use a refined, literary register that still sounds natural in Vietnamese.
+

@@ -61,3 +61,21 @@ def test_post_translate_single_q():
     assert resp.text == "hello -> vi"
 
 
+def test_get_translate_game_style_from_to():
+    resp = client.get(
+        "/language/translate/v2",
+        params={"from": "zh", "to": "vi", "text": "免费版"},
+    )
+    assert resp.status_code == 200
+    assert resp.text == "免费版 -> vi"
+
+
+def test_get_translate_missing_target_like_game():
+    resp = client.get(
+        "/language/translate/v2",
+        params={"from": "zh", "text": "免费版"},
+    )
+    assert resp.status_code == 400
+    data = resp.json()
+    assert data["detail"] == "target (or tl/to) is required"
+

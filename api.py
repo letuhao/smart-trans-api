@@ -1,6 +1,6 @@
 from typing import List, Optional, Sequence
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, HTTPException
 from fastapi.responses import PlainTextResponse
 
 from schemas import TranslateRequest, TranslateResponse, TranslateData, TranslationItem
@@ -58,22 +58,23 @@ async def translate_v2_get(
     # Google Translate–style aliases:
     sl: Optional[str] = Query(default=None),
     tl: Optional[str] = Query(default=None),
+    # Game-style aliases:
+    from_: Optional[str] = Query(default=None, alias="from"),
+    to: Optional[str] = Query(default=None),
     text: Optional[str] = Query(default=None),
     op: Optional[str] = Query(default=None),  # not used, but accepted for compatibility
     translator: TranslatorService = Depends(get_translator_service),
 ) -> str:
-    # Resolve source language: sl (Google) has priority, then source, then "auto".
-    src = sl or source or "auto"
+    # Resolve source language: sl (Google) has priority, then from_ (game), then source, then "auto".
+    src = sl or from_ or source or "auto"
     # Normalize locale codes like zh-CN -> zh
     if "-" in src:
         src = src.split("-", 1)[0]
 
-    # Resolve target language: tl (Google) has priority, then target (required in our API).
-    tgt = tl or target
+    # Resolve target language: tl (Google) has priority, then to (game), then target (required in our API).
+    tgt = tl or to or target
     if not tgt:
-        # FastAPI will turn this into a 422 validation error automatically if missing,
-        # but we guard here for completeness.
-        raise ValueError("target (or tl) is required")
+        raise HTTPException(status_code=400, detail="target (or tl/to) is required")
     if "-" in tgt:
         tgt = tgt.split("-", 1)[0]
 

@@ -1,6 +1,7 @@
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import PlainTextResponse
 
 from schemas import TranslateRequest, TranslateResponse, TranslateData, TranslationItem
 from translator import TranslatorService, get_translator_service
@@ -20,11 +21,20 @@ def _build_response(translations) -> TranslateResponse:
     return TranslateResponse(data=TranslateData(translations=items))
 
 
-@router.post("/v2", response_model=TranslateResponse)
+def _build_plain_response(translations: Sequence) -> str:
+    texts = [t.text for t in translations]
+    if not texts:
+        return ""
+    if len(texts) == 1:
+        return texts[0]
+    return "\n".join(texts)
+
+
+@router.post("/v2", response_class=PlainTextResponse)
 async def translate_v2(
     body: TranslateRequest,
     translator: TranslatorService = Depends(get_translator_service),
-) -> TranslateResponse:
+) -> str:
     texts: List[str]
     if isinstance(body.q, str):
         texts = [body.q]
@@ -37,10 +47,10 @@ async def translate_v2(
         target=body.target,
     )
 
-    return _build_response(translations)
+    return _build_plain_response(translations)
 
 
-@router.get("/v2", response_model=TranslateResponse)
+@router.get("/v2", response_class=PlainTextResponse)
 async def translate_v2_get(
     q: Optional[List[str]] = Query(default=None),
     source: Optional[str] = Query(default="auto"),
@@ -51,7 +61,7 @@ async def translate_v2_get(
     text: Optional[str] = Query(default=None),
     op: Optional[str] = Query(default=None),  # not used, but accepted for compatibility
     translator: TranslatorService = Depends(get_translator_service),
-) -> TranslateResponse:
+) -> str:
     # Resolve source language: sl (Google) has priority, then source, then "auto".
     src = sl or source or "auto"
     # Normalize locale codes like zh-CN -> zh
@@ -84,5 +94,5 @@ async def translate_v2_get(
         target=tgt,
     )
 
-    return _build_response(translations)
+    return _build_plain_response(translations)
 

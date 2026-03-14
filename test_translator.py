@@ -4,12 +4,11 @@ from unittest.mock import patch
 
 from translator import (
     _build_system_prompt,
-    _extract_content_and_parts,
-    _reassemble,
     _slice_text_by_chars,
     _strip_source_arrow_target,
     get_translator_service,
 )
+from pipeline_general import _extract_content_and_parts, _reassemble
 from config import get_settings
 
 

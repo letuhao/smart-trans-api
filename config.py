@@ -35,7 +35,14 @@ class GemmaSettings:
 
 
 @dataclass
+class TranslategemmaSettings:
+    user_input_format: str = "json"  # "json" | "raw"
+
+
+@dataclass
 class SessionSettings:
+    # "persistent" | "request" | "none". request = one random session per request; none = no session.
+    mode: str = "request"
     max_entries: int = 100
     max_chars: int = 4000
     ttl_seconds: int = 3600
@@ -61,6 +68,7 @@ class Settings:
     batch: BatchSettings
     cache: CacheSettings
     gemma: GemmaSettings
+    translategemma: TranslategemmaSettings
     session: SessionSettings
     default: DefaultSettings
     validation: ValidationSettings
@@ -83,6 +91,7 @@ def get_settings() -> Settings:
     batch = data.get("batch", {})
     cache = data.get("cache", {})
     gemma = data.get("gemma", {})
+    translategemma = data.get("translategemma", {})
     session = data.get("session", {})
     default = data.get("default", {})
     validation = data.get("validation", {})
@@ -107,7 +116,11 @@ def get_settings() -> Settings:
         max_retry_broken=int(gemma.get("max_retry_broken", 3)),
         temperature=float(gemma.get("temperature", 1.0)),
     )
+    translategemma_settings = TranslategemmaSettings(
+        user_input_format=str(translategemma.get("user_input_format", "json")).lower(),
+    )
     session_settings = SessionSettings(
+        mode=str(session.get("mode", "request")).lower(),
         max_entries=int(session.get("max_entries", 100)),
         max_chars=int(session.get("max_chars", 4000)),
         ttl_seconds=int(session.get("ttl_seconds", 3600)),
@@ -128,6 +141,7 @@ def get_settings() -> Settings:
         batch=batch_settings,
         cache=cache_settings,
         gemma=gemma_settings,
+        translategemma=translategemma_settings,
         session=session_settings,
         default=default_settings,
         validation=validation_settings,

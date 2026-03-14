@@ -1,4 +1,5 @@
 import re
+import uuid
 from typing import List, Optional, Sequence
 
 from fastapi import APIRouter, Depends, Query, HTTPException, Request
@@ -13,10 +14,25 @@ router = APIRouter(prefix="/language/translate", tags=["translate"])
 
 # Prefix for server-derived session IDs so they don't collide with client-provided ones.
 SESSION_PREFIX_IP = "ip:"
+SESSION_PREFIX_REQUEST = "req:"
 
 
-def _resolve_session_id(session_id: Optional[str], request: Request) -> Optional[str]:
-    """Use client-provided session_id if present; otherwise derive from client IP (stateful per IP)."""
+def _resolve_session_id(
+    session_id: Optional[str], request: Request
+) -> Optional[str]:
+    """
+    Resolve session_id according to session.mode:
+    - none: always None.
+    - request: one random session per request (client session_id ignored).
+    - persistent: client session_id if provided, else ip:{client_host}.
+    """
+    settings = get_settings()
+    mode = (getattr(settings.session, "mode", "request") or "request").lower()
+    if mode == "none":
+        return None
+    if mode == "request":
+        return f"{SESSION_PREFIX_REQUEST}{uuid.uuid4().hex}"
+    # persistent
     if session_id and session_id.strip():
         return session_id.strip()
     client_host = request.client.host if request.client else None

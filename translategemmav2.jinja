@@ -1,0 +1,15 @@
+{% for message in messages %}
+    {% if message['role'] == 'user' %}
+        {% set item = message['content'][0] %}
+        <|user|>
+        <|source_lang_{{ item['source_lang_code'] }}|>
+        <|target_lang_{{ item['target_lang_code'] }}|>
+        {{ item['text'] }}
+        <|end|>
+    {% elif message['role'] == 'assistant' %}
+        <|assistant|>
+        {{ message['content'] }}
+        <|end|>
+    {% endif %}
+{% endfor %}
+<|assistant|>

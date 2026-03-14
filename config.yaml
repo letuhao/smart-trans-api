@@ -4,8 +4,12 @@ lmstudio:
   endpoint_type: "chat"  # "chat" or "completion" (LM Studio interface type)
 
 batch:
-  max_size: 4
-  max_chars: 4000
+  max_size: 8
+  max_chars: 8000
+  # Smaller batches for zh→vi so Gemma translates every line instead of echoing Chinese.
+  zh_vi_max_size: 3
+  # Max retries for segments whose translation is broken (e.g. still contains Chinese); only for zh-vi.
+  max_retry_broken: 3
 
 cache:
   persistent_file: "cache.json"
@@ -27,26 +31,39 @@ prompts:
     Rules: Output only the translation, no explanations. Preserve meaning and
     tone. Use vocabulary natural to native speakers of {target_lang_name}.
   zh-vi: >
-    Role: You are a professional Chinese-to-Vietnamese translator for fantasy,
-    game UI, and mod descriptions.
-    Task: Translate the next message from Chinese ({source_lang_code}) to
-    Vietnamese ({target_lang_code}).
-    Input: You will receive only the source text. It may be one block or
-    multiple lines in the form 1. ... 2. ...
-    Output: Single block → output one translation. Multiple lines → output the
-    same number of lines in the same order, one translation per line, no line
-    numbers.
-    Rules: (1) Output only the translation, no explanations or commentary. (2)
-    Translate the entire message; every line, list item, and header must be in
-    Vietnamese. Do not leave any Chinese in the output (except numbers/symbols
-    as in the source). (3) Preserve all structural markers (【】, [], 《》,
-    colons, dashes, bullet numbers). (4) For lists and numbered items, translate
-    every item completely; section headers like 新增：, 修复：, 描述：, UI模块： →
-    Tăng mới:, Sửa lỗi:, Mô tả:, Mô-đun UI:. (5) Treat bracketed segments as
-    names/titles; translate literally and keep brackets (e.g. 【减负赋能】 →
-    【Giảm Tải Tiếp Sức】). (6) Use accurate Sino-Vietnamese (Hán-Việt): 宗门→tông
-    môn, 道侣→đạo lữ, 逆天→nghịch thiên, 改命→cải mệnh, 关系解除→giải trừ quan hệ,
-    邀请入宗→mời vào tông môn, 归宗→về tông môn, 先天气运→tiên thiên khí vận,
-    后天气运→hậu thiên khí vận. (7) Do not add or omit content. Clear, natural
-    Vietnamese suitable for game and mod text.
+    Output only Vietnamese (Latin script). Never output Chinese characters.
 
+    Role: Professional Game Translator (Chinese to Vietnamese).
+    Context: Xianxia/Wuxia game mods and UI.
+
+    Task: You are a "Content Replacement Engine". Your goal is to translate only the Chinese text into Sino-Vietnamese (Hán-Việt) while leaving all structural elements untouched.
+
+    Rules for Content:
+    1. Focus: Only translate Chinese characters. 
+    2. Vocabulary: Use formal Hán-Việt (e.g., 坐骑 -> Tọa Kỵ, 堪舆 -> Kham Dư, 宗门 -> Tông Môn).
+    3. Proper Nouns: Transliterate names character-by-character (e.g., 灰太狼 -> Hôi Thái Lang).
+    4. Completeness: Ensure every single Chinese character is replaced. Do not skip any.
+
+    Rules for Structure:
+    - Preservation: Treat tags (e.g., <size>, <color>), escape sequences (\n, \t), and symbols (【】, [], *, =) as "Anchor Points". 
+    - Mirroring: Do not add, delete, or reformat these Anchor Points. 
+    - Text Splitting: If a word is split by tags (like <color>太</color>极), translate the pieces so they still form the correct phrase (Thái Cực) when read together.
+
+    Segment mode: You may receive multiple short segments (one per line). Translate
+    each line fully; output the same number of lines in the same order. Preserve
+    newlines within a segment in the output. Do not skip any line.
+
+    Instruction:
+    Read the input, identify the Chinese text segments, and replace them with their
+    Vietnamese Hán-Việt equivalents. Output only the result.
+
+    Constraint: No Chinese characters allowed in output. No conversational filler.
+    Strict: Translate only the given text. Do not substitute with other content or
+    output from memory. Output must contain no Chinese and no non-Latin scripts
+    (e.g. no Cyrillic). Use only Vietnamese (Latin script) and numbers/symbols
+    as in the source. Output exactly one translated line per input line; do not
+    skip or merge lines.
+
+    Critical: Every single line must be translated. Never leave any line in Chinese.
+    If the input has N lines (including empty lines), output must have exactly N
+    lines in the same order. Empty input line → empty output line. No exceptions.

@@ -18,6 +18,8 @@ class LMStudioSettings:
 class BatchSettings:
     max_size: int = 8
     max_chars: int = 8000
+    zh_vi_max_size: Optional[int] = None
+    max_retry_broken: int = 3
 
 
 @dataclass
@@ -66,6 +68,8 @@ def get_settings() -> Settings:
     batch_settings = BatchSettings(
         max_size=int(batch.get("max_size", 8)),
         max_chars=int(batch.get("max_chars", 8000)),
+        zh_vi_max_size=int(batch["zh_vi_max_size"]) if "zh_vi_max_size" in batch else None,
+        max_retry_broken=int(batch.get("max_retry_broken", 3)),
     )
     cache_settings = CacheSettings(
         persistent_file=str(cache.get("persistent_file", "cache.json")),

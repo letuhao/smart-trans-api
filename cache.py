@@ -44,3 +44,10 @@ class TranslationCache:
         self._data.update(entries)
         self._save()
 
+    def delete_many(self, keys: Iterable[str]) -> None:
+        removed = False
+        for k in keys:
+            if self._data.pop(k, None) is not None:
+                removed = True
+        if removed:
+            self._save()

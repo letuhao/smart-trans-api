@@ -1,8 +1,165 @@
 import asyncio
 from unittest.mock import patch
 
-from translator import _build_system_prompt, get_translator_service
+from translator import (
+    _build_system_prompt,
+    _extract_content_and_parts,
+    _reassemble,
+    get_translator_service,
+)
 from config import get_settings
+
+
+def test_extract_content_and_parts_plain_text():
+    """No tags: one part, one segment."""
+    parts, segment_indices = _extract_content_and_parts("hello world")
+    assert parts == ["hello world"]
+    assert segment_indices == [0]
+
+
+def test_extract_content_and_parts_with_tags():
+    """Tags split content; only non-empty content is a segment."""
+    text = "【Xiao】<color=#FFF>太</color><color=#DDD>极</color>卦"
+    parts, segment_indices = _extract_content_and_parts(text)
+    assert parts == [
+        "【Xiao】",
+        "<color=#FFF>",
+        "太",
+        "</color>",
+        "",
+        "<color=#DDD>",
+        "极",
+        "</color>",
+        "卦",
+    ]
+    # Content at even indices: 0, 2, 4, 6, 8. Non-empty: 0, 2, 6, 8 (4 is empty)
+    assert segment_indices == [0, 2, 6, 8]
+    assert [parts[i] for i in segment_indices] == ["【Xiao】", "太", "极", "卦"]
+
+
+def test_extract_content_and_parts_only_tags():
+    """Only tags and empty content: no segments."""
+    parts, segment_indices = _extract_content_and_parts("<a></a><b></b>")
+    assert segment_indices == []
+    assert "" in parts
+
+
+def test_multiline_content_yields_multiple_segments_and_segment_counts():
+    """Content with newlines is split into one segment per line; segment_counts match."""
+    # Same logic as in translate_batch: split content by newline per part.
+    text = "line1\nline2\nline3"
+    parts, segment_indices = _extract_content_and_parts(text)
+    assert parts == ["line1\nline2\nline3"]
+    assert segment_indices == [0]
+    segments = []
+    segment_counts = []
+    for i in segment_indices:
+        lines = parts[i].splitlines()
+        segment_counts.append(len(lines))
+        segments.extend(lines)
+    assert segments == ["line1", "line2", "line3"]
+    assert segment_counts == [3]
+
+
+def test_reassemble_plain():
+    """One segment replaced."""
+    parts = ["hello"]
+    segment_indices = [0]
+    translations = ["xin chào"]
+    assert _reassemble(parts, segment_indices, translations) == "xin chào"
+
+
+def test_reassemble_with_tags():
+    """Content segments replaced; tags unchanged."""
+    parts = ["【Xiao】", "<color=#FFF>", "太", "</color>", "卦"]
+    segment_indices = [0, 2, 4]
+    translations = ["【Tiểu】", "Thái", "Quái"]
+    out = _reassemble(parts, segment_indices, translations)
+    assert out == "【Tiểu】<color=#FFF>Thái</color>Quái"
+
+
+def test_reassemble_with_segment_counts():
+    """When segment_counts is given, each content part uses that many translations joined by newline."""
+    # One content part split into 3 lines -> 3 segments
+    parts = ["a\nb\nc"]
+    segment_indices = [0]
+    translations = ["A", "B", "C"]
+    out = _reassemble(parts, segment_indices, translations, segment_counts=[3])
+    assert out == "A\nB\nC"
+
+    # Two content parts: first 2 lines, second 1 line
+    parts = ["x", "<tag>", "p\nq", "</tag>", "z"]
+    segment_indices = [0, 2, 4]
+    segment_counts = [1, 2, 1]  # "x" -> 1, "p\nq" -> 2, "z" -> 1
+    translations = ["X", "P", "Q", "Z"]
+    out = _reassemble(parts, segment_indices, translations, segment_counts=segment_counts)
+    assert out == "X<tag>P\nQ</tag>Z"
+
+
+def test_translate_batch_markup_structure_preserved():
+    """Integration: translate_batch with markup preserves tags; segments are translated."""
+    async def _run():
+        from unittest.mock import AsyncMock
+
+        from cache import TranslationCache
+        from translator import TranslatorService
+
+        settings = get_settings()
+        cache = TranslationCache(settings)
+        service = TranslatorService(settings=settings, cache=cache)
+
+        # "【X】<t>太</t>卦" -> 3 segments (one per content part, no newlines). Use empty cache so all 3 come from mock.
+        class FakeResponse:
+            status_code = 200
+            def raise_for_status(self): pass
+            def json(self):
+                return {"choices": [{"message": {"content": "L1\nL2\nL3"}}]}
+
+        with patch.object(cache, "get_many", return_value={}):
+            with patch.object(service._client, "post", new_callable=AsyncMock, return_value=FakeResponse()):
+                results = await service.translate_batch(
+                    texts=["【X】<t>太</t>卦"],
+                    source="zh",
+                    target="vi",
+                )
+        assert len(results) == 1
+        out = results[0].text
+        assert "<t>" in out and "</t>" in out
+        assert "L1" in out and "L2" in out and "L3" in out
+
+    asyncio.run(_run())
+
+
+def test_translate_batch_multiline_preserves_newlines():
+    """Integration: content with newlines is split into lines, translated, then rejoined."""
+    async def _run():
+        from unittest.mock import AsyncMock
+
+        from cache import TranslationCache
+        from translator import TranslatorService
+
+        settings = get_settings()
+        cache = TranslationCache(settings)
+        service = TranslatorService(settings=settings, cache=cache)
+
+        # "a\nb" -> 2 segments; mock returns two lines so we get two translations rejoined.
+        class FakeResponse:
+            status_code = 200
+            def raise_for_status(self): pass
+            def json(self):
+                return {"choices": [{"message": {"content": "A\nB"}}]}
+
+        with patch.object(cache, "get_many", return_value={}):
+            with patch.object(service._client, "post", new_callable=AsyncMock, return_value=FakeResponse()):
+                results = await service.translate_batch(
+                    texts=["a\nb"],
+                    source="zh",
+                    target="vi",
+                )
+        assert len(results) == 1
+        assert results[0].text == "A\nB"
+
+    asyncio.run(_run())
 
 
 def test_build_system_prompt_zh_vi_uses_direction_specific_template():
@@ -10,10 +167,8 @@ def test_build_system_prompt_zh_vi_uses_direction_specific_template():
 
     prompt = _build_system_prompt(settings, "zh", "vi")
 
-    assert "Chinese-to-Vietnamese" in prompt
+    assert "Chinese" in prompt and "Vietnamese" in prompt
     assert "source_lang_code" not in prompt  # placeholders should be formatted
-    assert "zh" in prompt
-    assert "vi" in prompt
 
 
 def test_translate_chinese_to_vietnamese_end_to_end():

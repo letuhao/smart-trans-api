@@ -26,9 +26,22 @@ from config import Settings, ValidationSettings, get_settings
 from session_context import SessionContextStore
 from pipeline_translategemma import call_translategemma_with_json
 from pipeline_general import (
-    _contains_chinese,
     _is_translation_acceptable_zh_vi,
     translate_batch_general,
+)
+from pipeline_gemma import (
+    _build_system_prompt_gemma_3_12b,
+    _normalize_excess_newlines,
+    _slice_text_by_chars,
+    _strip_source_arrow_target,
+    translate_batch_gemma,
+)
+from pipeline_deepseek import (
+    build_system_prompt_deepseek,
+    build_user_prompt_deepseek,
+    strip_think_block,
+    strip_translation_artifacts,
+    translate_batch_deepseek,
 )
 
 
@@ -76,112 +89,9 @@ def _is_gemma_pipeline_model(settings: Settings) -> bool:
     return "gemma" in name and "translategemma" not in name
 
 
-def _build_system_prompt_gemma_3_12b(
-    settings: Settings, source_lang: str, target_lang: str
-) -> str:
-    """Build system prompt for Gemma-3-12b using gemma_3_12b_{source}_{target} templates."""
-    source_lang = (source_lang or settings.default.source_lang).lower()
-    target_lang = (target_lang or settings.default.target_lang).lower()
-    templates = settings.prompts or {}
-    # Key: gemma_3_12b + from + to (underscores to match config keys e.g. gemma_3_12b_zh_vi).
-    prompt_key = f"gemma_3_12b_{source_lang}_{target_lang}"
-    template = templates.get(prompt_key) or templates.get("gemma_3_12b_default")
-    if not template:
-        template = (
-            "You are a professional translation engine. Translate the user message "
-            "from {source_lang_name} to {target_lang_name}. Output only the translation."
-        )
-    return template.format(
-        source_lang_code=source_lang,
-        target_lang_code=target_lang,
-        source_lang_name=_language_name_from_code(source_lang),
-        target_lang_name=_language_name_from_code(target_lang),
-    )
-
-
-def _normalize_excess_newlines(text: str) -> str:
-    """Collapse 3+ consecutive newlines to at most 2; strip leading/trailing whitespace."""
-    normalized = re.sub(r"\n{3,}", "\n\n", text)
-    return normalized.strip()
-
-
-def _strip_source_arrow_target(content: str) -> str:
-    """If model returned 'source -> translation' format, keep only the translation part."""
-    if " -> " not in content:
-        return content
-    parts = content.split(" -> ", 1)
-    if len(parts) != 2:
-        return content
-    before, after = parts[0].strip(), parts[1].strip()
-    if not after:
-        return content
-    if _contains_chinese(before) and len(before) < 200:
-        return after
-    return content
-
-
-# Sentence/paragraph end characters for smart slice (avoid breaking context).
-_SLICE_PARAGRAPH = "\n\n"
-_SLICE_LINE = "\n"
-_SLICE_SENTENCE = ".?!。？！…"
-_SLICE_CLAUSE = ";；,，"
-
-
-def _last_break_position(chunk: str) -> int:
-    """
-    Return the position after the last "good" break in chunk (paragraph > line > sentence > clause).
-    Position is 1-based end index (split after this index). Returns 0 if no break found.
-    """
-    best = 0
-    # Paragraph: last double newline
-    i = chunk.rfind(_SLICE_PARAGRAPH)
-    if i != -1:
-        best = max(best, i + len(_SLICE_PARAGRAPH))
-    # Line: last single newline
-    i = chunk.rfind(_SLICE_LINE)
-    if i != -1:
-        best = max(best, i + 1)
-    # Sentence end: last of . ? ! 。 ？ ！ …
-    for c in _SLICE_SENTENCE:
-        i = chunk.rfind(c)
-        if i != -1:
-            best = max(best, i + 1)
-    # Clause: last of ; ， ；
-    for c in _SLICE_CLAUSE:
-        i = chunk.rfind(c)
-        if i != -1:
-            best = max(best, i + 1)
-    return best
-
-
-def _slice_text_by_chars(text: str, max_chars: int) -> List[str]:
-    """
-    Split text into parts of at most max_chars, at natural boundaries to avoid breaking
-    sentences or paragraphs. Prefer: paragraph (\\n\\n) > line (\\n) > sentence (.?!。？！…) > clause (;，；).
-    """
-    if max_chars <= 0 or len(text) <= max_chars:
-        return [text] if text.strip() else []
-    parts: List[str] = []
-    start = 0
-    while start < len(text):
-        end = min(start + max_chars, len(text))
-        chunk = text[start:end]
-        if end == len(text):
-            if chunk.strip():
-                parts.append(chunk)
-            break
-        last_break = _last_break_position(chunk)
-        if last_break > 0:
-            cut = start + last_break
-            part = text[start:cut]
-            if part.strip():
-                parts.append(part)
-            start = cut
-        else:
-            if chunk.strip():
-                parts.append(chunk)
-            start = end
-    return parts if parts else [text]
+def _is_deepseek_pipeline_model(settings: Settings) -> bool:
+    """True if the model is DeepSeek (use DeepSeek pipeline with zh→vi prompts)."""
+    return "deepseek" in (settings.lmstudio.model or "").lower()
 
 
 @dataclass
@@ -216,6 +126,8 @@ class TranslatorService:
         model_name = (self._settings.lmstudio.model or "").lower()
         if "translategemma" in model_name:
             return await self._translate_batch_translategemma(texts, source_lang, target_lang, session_id)
+        if _is_deepseek_pipeline_model(self._settings):
+            return await self._translate_batch_deepseek(texts, source_lang, target_lang, session_id)
         if _is_gemma_pipeline_model(self._settings):
             return await self._translate_batch_gemma(texts, source_lang, target_lang, session_id)
         return await self._translate_batch_general(texts, source_lang, target_lang, session_id)
@@ -227,45 +139,42 @@ class TranslatorService:
         target_lang: str,
         session_id: Optional[str],
     ) -> List[TranslationResult]:
-        """Gemma-3-12b pipeline: cache hit (no validate), slice large input, translate parts with retry, post-process, cache set."""
-        detected = source_lang if source_lang != "auto" else None
-        session_context = ""
-        if session_id and self._session_store and getattr(self._settings.session, "inject_context_into_prompt", False):
-            session_context = self._session_store.get_context(session_id)
-        gemma_cfg = getattr(self._settings, "gemma", None)
-        max_slice = getattr(gemma_cfg, "max_slice_chars", 2000) if gemma_cfg else 2000
-        max_retry = getattr(gemma_cfg, "max_retry_broken", 3) if gemma_cfg else 3
-        is_zh_vi = source_lang and target_lang and source_lang.lower() == "zh" and target_lang.lower() == "vi"
-        results: List[TranslationResult] = []
-        for text in texts:
-            key = self._cache.make_key(source_lang, target_lang, text)
-            cached = self._cache.get_many([key])
-            if key in cached:
-                results.append(TranslationResult(text=cached[key], detected_source_language=detected))
-                continue
-            if not text.strip():
-                results.append(TranslationResult(text=text, detected_source_language=detected))
-                continue
-            parts = _slice_text_by_chars(text, max_slice)
-            if not parts:
-                parts = [text]
-            translated_parts: List[str] = []
-            for part in parts:
-                last_out = ""
-                for _attempt in range(max_retry):
-                    out_list = await self._call_gemma_3_12b([part], source_lang, target_lang, context=session_context)
-                    last_out = out_list[0] if out_list else ""
-                    if is_zh_vi and not _is_translation_acceptable_zh_vi(last_out, self._settings.validation):
-                        continue
-                    break
-                translated_parts.append(last_out)
-            full = "\n".join(translated_parts)
-            full = _normalize_excess_newlines(full)
-            self._cache.set_many({key: full})
-            if session_id and self._session_store:
-                self._session_store.append(session_id, [(text, full)])
-            results.append(TranslationResult(text=full, detected_source_language=detected))
-        return results
+        """Delegate to Gemma pipeline; wrap (text, detected) results as TranslationResult."""
+        raw = await translate_batch_gemma(
+            texts=texts,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            session_id=session_id,
+            settings=self._settings,
+            cache=self._cache,
+            session_store=self._session_store,
+            call_gemma_3_12b=self._call_gemma_3_12b,
+        )
+        return [
+            TranslationResult(text=t, detected_source_language=d) for t, d in raw
+        ]
+
+    async def _translate_batch_deepseek(
+        self,
+        texts: List[str],
+        source_lang: str,
+        target_lang: str,
+        session_id: Optional[str],
+    ) -> List[TranslationResult]:
+        """Delegate to DeepSeek pipeline; wrap (text, detected) results as TranslationResult."""
+        raw = await translate_batch_deepseek(
+            texts=texts,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            session_id=session_id,
+            settings=self._settings,
+            cache=self._cache,
+            session_store=self._session_store,
+            call_deepseek=self._call_deepseek,
+        )
+        return [
+            TranslationResult(text=t, detected_source_language=d) for t, d in raw
+        ]
 
     async def _translate_batch_translategemma(
         self,
@@ -410,6 +319,10 @@ class TranslatorService:
         if "gemma" in model_name and "translategemma" not in model_name:
             return await self._call_gemma_3_12b(batch, source, target, context=context)
 
+        # DeepSeek: system + user prompt (zh→vi Vietnamese instructions), one request per item.
+        if "deepseek" in model_name:
+            return await self._call_deepseek(batch, source, target, context=context)
+
         if endpoint_type == "chat":
             return await self._call_lmstudio_chat(batch, source, target, context=context)
         if endpoint_type == "completion":
@@ -472,6 +385,67 @@ class TranslatorService:
             content = data["choices"][0]["message"]["content"]
             if not isinstance(content, str):
                 content = str(content)
+            content = _strip_source_arrow_target(content)
+            outputs.append(_normalize_excess_newlines(content))
+        return outputs
+
+    async def _call_deepseek(
+        self,
+        batch: List[str],
+        source: str,
+        target: str,
+        context: str = "",
+    ) -> List[str]:
+        """
+        Call DeepSeek with zh→vi system/user prompts (Vietnamese instructions).
+        User message: "Hãy dịch ra tiếng Việt với nội dung bên dưới:\n" + raw input.
+        One request per batch item; post-process excess newlines.
+        """
+        system_prompt = build_system_prompt_deepseek(
+            self._settings, source, target
+        )
+        if context:
+            system_prompt = context.rstrip() + "\n\n" + system_prompt
+        gemma_cfg = getattr(self._settings, "gemma", None)
+        temperature = getattr(gemma_cfg, "temperature", 1.0) if gemma_cfg else 1.0
+        outputs: List[str] = []
+        for text in batch:
+            user_content = build_user_prompt_deepseek(text, source, target, self._settings)
+            body = {
+                "model": self._settings.lmstudio.model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                "temperature": temperature,
+            }
+            print(
+                "[_call_deepseek] request",
+                json.dumps(
+                    {
+                        "url": f"{self._settings.lmstudio.base_url}/chat/completions",
+                        "model": self._settings.lmstudio.model,
+                    },
+                    ensure_ascii=False,
+                ),
+                file=sys.stderr,
+            )
+            resp = await self._client.post("/chat/completions", json=body)
+            resp.raise_for_status()
+            data = resp.json()
+            print(
+                "[_call_deepseek] response",
+                json.dumps(
+                    {"raw_preview": str(data)[:200]},
+                    ensure_ascii=False,
+                ),
+                file=sys.stderr,
+            )
+            content = data["choices"][0]["message"]["content"]
+            if not isinstance(content, str):
+                content = str(content)
+            content = strip_think_block(content)
+            content = strip_translation_artifacts(content)
             content = _strip_source_arrow_target(content)
             outputs.append(_normalize_excess_newlines(content))
         return outputs

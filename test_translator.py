@@ -2,13 +2,9 @@ import asyncio
 import dataclasses
 from unittest.mock import patch
 
-from translator import (
-    _build_system_prompt,
-    _slice_text_by_chars,
-    _strip_source_arrow_target,
-    get_translator_service,
-)
+from translator import _build_system_prompt, get_translator_service
 from pipeline_general import _extract_content_and_parts, _reassemble
+from pipeline_gemma import _slice_text_by_chars, _strip_source_arrow_target
 from config import get_settings
 
 

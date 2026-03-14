@@ -1,6 +1,6 @@
 lmstudio:
   base_url: "http://localhost:1234/v1"
-  model: "google/gemma-3-4b"
+  model: "google/gemma-3-12b"
   endpoint_type: "chat"  # "chat" or "completion" (LM Studio interface type)
 
 batch:
@@ -143,3 +143,11 @@ prompts:
 
   translategemma_default: >
     Translate from {source_lang_name} to {target_lang_name}. Output only the translation, preserve structure. No explanations.
+
+  # DeepSeek pipeline (zh-vi): system + user prefix in Vietnamese.
+  deepseek_zh_vi: >
+    Hãy dịch input từ từ tiếng Trung ra tiếng Việt, tên riêng cần dùng từ Hán Viết để thể hiện, chỉ nhận duy nhất 1 kết quả output, không đặt câu hỏi, không giải thích, không thêm ghi chú, giữ cấu trúc của input
+  deepseek_default: >
+    Translate the user input from {source_lang_name} to {target_lang_name}. Output only the translation, no questions, no explanations, no notes. Preserve input structure.
+  # User message prefix for zh-vi (prepended before raw input).
+  deepseek_user_prefix_zh_vi: "Hãy dịch ra tiếng Việt với nội dung bên dưới, không giải thích, dùng từ Hán-Việt để thể hiện tên riêng của sự vật, sự việc, tên người, địa danh:\n"

@@ -23,6 +23,7 @@ def _debug_log(session_id: str, hypothesis_id: str, location: str, message: str,
 
 from cache import TranslationCache
 from config import Settings, get_settings
+from session_context import SessionContextStore
 
 
 LANGUAGE_NAMES: Dict[str, str] = {
@@ -66,6 +67,120 @@ def _build_system_prompt(settings: Settings, source_lang: str, target_lang: str)
         source_lang_name=_language_name_from_code(source_lang),
         target_lang_name=_language_name_from_code(target_lang),
     )
+
+
+def _is_gemma_pipeline_model(settings: Settings) -> bool:
+    """True if the model is a Gemma model (use Gemma pipeline) but not Translategemma."""
+    name = (settings.lmstudio.model or "").lower()
+    return "gemma" in name and "translategemma" not in name
+
+
+def _build_system_prompt_gemma_3_12b(
+    settings: Settings, source_lang: str, target_lang: str
+) -> str:
+    """Build system prompt for Gemma-3-12b using gemma_3_12b_{source}_{target} templates."""
+    source_lang = (source_lang or settings.default.source_lang).lower()
+    target_lang = (target_lang or settings.default.target_lang).lower()
+    templates = settings.prompts or {}
+    # Key: gemma_3_12b + from + to (underscores to match config keys e.g. gemma_3_12b_zh_vi).
+    prompt_key = f"gemma_3_12b_{source_lang}_{target_lang}"
+    template = templates.get(prompt_key) or templates.get("gemma_3_12b_default")
+    if not template:
+        template = (
+            "You are a professional translation engine. Translate the user message "
+            "from {source_lang_name} to {target_lang_name}. Output only the translation."
+        )
+    return template.format(
+        source_lang_code=source_lang,
+        target_lang_code=target_lang,
+        source_lang_name=_language_name_from_code(source_lang),
+        target_lang_name=_language_name_from_code(target_lang),
+    )
+
+
+def _normalize_excess_newlines(text: str) -> str:
+    """Collapse 3+ consecutive newlines to at most 2; strip leading/trailing whitespace."""
+    normalized = re.sub(r"\n{3,}", "\n\n", text)
+    return normalized.strip()
+
+
+def _strip_source_arrow_target(content: str) -> str:
+    """If model returned 'source -> translation' format, keep only the translation part."""
+    if " -> " not in content:
+        return content
+    parts = content.split(" -> ", 1)
+    if len(parts) != 2:
+        return content
+    before, after = parts[0].strip(), parts[1].strip()
+    if not after:
+        return content
+    if _contains_chinese(before) and len(before) < 200:
+        return after
+    return content
+
+
+# Sentence/paragraph end characters for smart slice (avoid breaking context).
+_SLICE_PARAGRAPH = "\n\n"
+_SLICE_LINE = "\n"
+_SLICE_SENTENCE = ".?!。？！…"
+_SLICE_CLAUSE = ";；,，"
+
+
+def _last_break_position(chunk: str) -> int:
+    """
+    Return the position after the last "good" break in chunk (paragraph > line > sentence > clause).
+    Position is 1-based end index (split after this index). Returns 0 if no break found.
+    """
+    best = 0
+    # Paragraph: last double newline
+    i = chunk.rfind(_SLICE_PARAGRAPH)
+    if i != -1:
+        best = max(best, i + len(_SLICE_PARAGRAPH))
+    # Line: last single newline
+    i = chunk.rfind(_SLICE_LINE)
+    if i != -1:
+        best = max(best, i + 1)
+    # Sentence end: last of . ? ! 。 ？ ！ …
+    for c in _SLICE_SENTENCE:
+        i = chunk.rfind(c)
+        if i != -1:
+            best = max(best, i + 1)
+    # Clause: last of ; ， ；
+    for c in _SLICE_CLAUSE:
+        i = chunk.rfind(c)
+        if i != -1:
+            best = max(best, i + 1)
+    return best
+
+
+def _slice_text_by_chars(text: str, max_chars: int) -> List[str]:
+    """
+    Split text into parts of at most max_chars, at natural boundaries to avoid breaking
+    sentences or paragraphs. Prefer: paragraph (\\n\\n) > line (\\n) > sentence (.?!。？！…) > clause (;，；).
+    """
+    if max_chars <= 0 or len(text) <= max_chars:
+        return [text] if text.strip() else []
+    parts: List[str] = []
+    start = 0
+    while start < len(text):
+        end = min(start + max_chars, len(text))
+        chunk = text[start:end]
+        if end == len(text):
+            if chunk.strip():
+                parts.append(chunk)
+            break
+        last_break = _last_break_position(chunk)
+        if last_break > 0:
+            cut = start + last_break
+            part = text[start:cut]
+            if part.strip():
+                parts.append(part)
+            start = cut
+        else:
+            if chunk.strip():
+                parts.append(chunk)
+            start = end
+    return parts if parts else [text]
 
 
 def _extract_content_and_parts(text: str) -> Tuple[List[str], List[int]]:
@@ -122,63 +237,116 @@ class TranslationResult:
 
 
 class TranslatorService:
-    def __init__(self, settings: Settings, cache: TranslationCache) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        cache: TranslationCache,
+        session_store: Optional[SessionContextStore] = None,
+    ) -> None:
         self._settings = settings
         self._cache = cache
+        self._session_store = session_store
         self._client = httpx.AsyncClient(base_url=self._settings.lmstudio.base_url, timeout=60.0)
 
-    async def translate_batch(self, texts: List[str], source: str, target: str) -> List[TranslationResult]:
+    async def translate_batch(
+        self,
+        texts: List[str],
+        source: str,
+        target: str,
+        session_id: Optional[str] = None,
+    ) -> List[TranslationResult]:
         if not texts:
             return []
-
         source_lang = source or self._settings.default.source_lang
         target_lang = target or self._settings.default.target_lang
-        detected = source_lang if source_lang != "auto" else None
+        if _is_gemma_pipeline_model(self._settings):
+            return await self._translate_batch_gemma(texts, source_lang, target_lang, session_id)
+        return await self._translate_batch_general(texts, source_lang, target_lang, session_id)
 
-        # Extract content segments per text (split by tags, then by newline); collect all for batch translation.
+    async def _translate_batch_gemma(
+        self,
+        texts: List[str],
+        source_lang: str,
+        target_lang: str,
+        session_id: Optional[str],
+    ) -> List[TranslationResult]:
+        """Gemma-3-12b pipeline: cache hit (no validate), slice large input, translate parts with retry, post-process, cache set."""
+        detected = source_lang if source_lang != "auto" else None
+        session_context = ""
+        if session_id and self._session_store and getattr(self._settings.session, "inject_context_into_prompt", False):
+            session_context = self._session_store.get_context(session_id)
+        gemma_cfg = getattr(self._settings, "gemma", None)
+        max_slice = getattr(gemma_cfg, "max_slice_chars", 2000) if gemma_cfg else 2000
+        max_retry = getattr(gemma_cfg, "max_retry_broken", 3) if gemma_cfg else 3
+        is_zh_vi = source_lang and target_lang and source_lang.lower() == "zh" and target_lang.lower() == "vi"
+        results: List[TranslationResult] = []
+        for text in texts:
+            key = self._cache.make_key(source_lang, target_lang, text)
+            cached = self._cache.get_many([key])
+            if key in cached:
+                results.append(TranslationResult(text=cached[key], detected_source_language=detected))
+                continue
+            if not text.strip():
+                results.append(TranslationResult(text=text, detected_source_language=detected))
+                continue
+            parts = _slice_text_by_chars(text, max_slice)
+            if not parts:
+                parts = [text]
+            translated_parts: List[str] = []
+            for part in parts:
+                last_out = ""
+                for _attempt in range(max_retry):
+                    out_list = await self._call_gemma_3_12b([part], source_lang, target_lang, context=session_context)
+                    last_out = out_list[0] if out_list else ""
+                    if is_zh_vi and _contains_chinese(last_out):
+                        continue
+                    break
+                translated_parts.append(last_out)
+            full = "\n".join(translated_parts)
+            full = _normalize_excess_newlines(full)
+            self._cache.set_many({key: full})
+            if session_id and self._session_store:
+                self._session_store.append(session_id, [(text, full)])
+            results.append(TranslationResult(text=full, detected_source_language=detected))
+        return results
+
+    async def _translate_batch_general(
+        self,
+        texts: List[str],
+        source_lang: str,
+        target_lang: str,
+        session_id: Optional[str],
+    ) -> List[TranslationResult]:
+        """General pipeline: pre-process to segments (extract tags, split lines), cache with validate, translate missing, retry broken, reassemble."""
+        detected = source_lang if source_lang != "auto" else None
         per_text: List[Tuple[List[str], List[int], List[int], int, int]] = []
         all_segments: List[str] = []
         for text in texts:
             parts, segment_indices = _extract_content_and_parts(text)
             segments: List[str] = []
             segment_counts: List[int] = []
-            for i in segment_indices:
-                lines = parts[i].splitlines()
+            for idx in segment_indices:
+                lines = parts[idx].splitlines()
                 segment_counts.append(len(lines))
                 segments.extend(lines)
             start = len(all_segments)
             all_segments.extend(segments)
             per_text.append((parts, segment_indices, segment_counts, start, len(segments)))
-
-        # #region agent log
-        if per_text:
-            p0 = per_text[0]
-            start0, count0 = p0[3], p0[4]
-            seg_previews = [all_segments[i][:55] for i in range(start0, min(start0 + 12, len(all_segments)))]
-            _debug_log("b5af83", "H3", "translator.py:extract", "per_text segment_counts and first segments", {"segments_count": len(all_segments), "text0_start": start0, "text0_count": count0, "text0_segment_counts": p0[2], "first_segment_previews": seg_previews})
-        # #endregion
-
         print(
             "[translate_batch] start",
             json.dumps(
-                {
-                    "source_lang": source_lang,
-                    "target_lang": target_lang,
-                    "texts_count": len(texts),
-                    "segments_count": len(all_segments),
-                },
+                {"source_lang": source_lang, "target_lang": target_lang, "texts_count": len(texts), "segments_count": len(all_segments)},
                 ensure_ascii=False,
             ),
             file=sys.stderr,
         )
-
         if not all_segments:
             return [TranslationResult(text=text, detected_source_language=detected) for text in texts]
-
+        session_context = ""
+        if session_id and self._session_store and getattr(self._settings.session, "inject_context_into_prompt", False):
+            session_context = self._session_store.get_context(session_id)
         keys = [self._cache.make_key(source_lang, target_lang, s) for s in all_segments]
         cached = self._cache.get_many(keys)
-
-        # One pass: check cache existence, detect broken (zh-vi + value has Chinese), collect missing + broken_keys.
         is_zh_vi = source_lang and target_lang and source_lang.lower() == "zh" and target_lang.lower() == "vi"
         missing_indices: List[int] = []
         broken_keys: List[str] = []
@@ -188,42 +356,17 @@ class TranslatorService:
             elif is_zh_vi and _contains_chinese(cached.get(keys[i], "")):
                 broken_keys.append(keys[i])
                 missing_indices.append(i)
-            # else: cache valid, use it
         if broken_keys:
             self._cache.delete_many(broken_keys)
-
         missing_texts = [all_segments[i] for i in missing_indices]
         valid_cache = {i for i in range(len(all_segments)) if i not in missing_indices}
-
-        # #region agent log
-        cache_hit_sample = [(i, all_segments[i][:40], (cached.get(keys[i], "") or "")[:40]) for i in range(min(5, len(all_segments))) if i in valid_cache][:3]
-        _debug_log("b5af83", "H2", "translator.py:cache_lookup", "cache hit sample", {"cache_hits": len(valid_cache), "missing_count": len(missing_indices), "cache_hit_sample": cache_hit_sample})
-        # #endregion
-
-        for idx in valid_cache:
-            print(
-                "[translate_batch] cache_hit",
-                json.dumps(
-                    {"index": idx, "key_preview": keys[idx][:80]},
-                    ensure_ascii=False,
-                ),
-                file=sys.stderr,
-            )
-
         all_translations: List[str] = [cached.get(keys[i], "") if i in valid_cache else "" for i in range(len(all_segments))]
         if missing_texts:
-            print(
-                "[translate_batch] cache_miss_batch",
-                json.dumps({"missing_count": len(missing_texts)}, ensure_ascii=False),
-                file=sys.stderr,
-            )
             new_translations = await self._translate_with_lmstudio(
-                missing_texts, source_lang, target_lang
+                missing_texts, source_lang, target_lang, context=session_context
             )
             for j, idx in enumerate(missing_indices):
                 all_translations[idx] = new_translations[j]
-
-            # After translate: validate (zh-vi no Chinese); retry broken up to max_retry_broken; cache only valid.
             max_retry = getattr(self._settings.batch, "max_retry_broken", 3)
             retry_list: List[Tuple[int, str]] = [
                 (idx, all_segments[idx])
@@ -234,42 +377,46 @@ class TranslatorService:
                 if not retry_list:
                     break
                 retry_texts = [seg for _idx, seg in retry_list]
-                retry_trans = await self._translate_with_lmstudio(retry_texts, source_lang, target_lang)
+                retry_trans = await self._translate_with_lmstudio(
+                    retry_texts, source_lang, target_lang, context=session_context
+                )
                 next_retry: List[Tuple[int, str]] = []
                 for k, (idx, _seg) in enumerate(retry_list):
                     all_translations[idx] = retry_trans[k]
                     if is_zh_vi and _contains_chinese(retry_trans[k]):
                         next_retry.append((idx, all_segments[idx]))
-                    # else: OK, no retry
                 retry_list = next_retry
-
-            cache_updates: Dict[str, str] = {}
-            for j, idx in enumerate(missing_indices):
-                trans = all_translations[idx]
-                if not (is_zh_vi and _contains_chinese(trans)):
-                    cache_updates[keys[idx]] = trans
+            cache_updates = {
+                keys[idx]: all_translations[idx]
+                for idx in missing_indices
+                if not (is_zh_vi and _contains_chinese(all_translations[idx]))
+            }
             self._cache.set_many(cache_updates)
-        # #region agent log
-        if per_text and all_segments and all_translations:
-            start0, count0 = per_text[0][3], per_text[0][4]
-            alignment = [{"idx": i, "seg": all_segments[i][:50], "trans": all_translations[i][:50]} for i in range(start0, min(start0 + 20, start0 + count0))]
-            _debug_log("b5af83", "H2_H4", "translator.py:after_merge", "segment-to-translation alignment", {"start": start0, "count": count0, "alignment": alignment})
-        # #endregion
-
-        results: List[TranslationResult] = []
+            if session_id and self._session_store:
+                self._session_store.append(
+                    session_id,
+                    [(all_segments[idx], all_translations[idx]) for idx in missing_indices],
+                )
+        results = []
         for text, (parts, segment_indices, segment_counts, start, count) in zip(texts, per_text):
             slice_trans = all_translations[start : start + count]
             reassembled = _reassemble(parts, segment_indices, slice_trans, segment_counts)
             results.append(TranslationResult(text=reassembled, detected_source_language=detected))
-
         return results
 
-    async def _translate_with_lmstudio(self, texts: List[str], source: str, target: str) -> List[str]:
+    async def _translate_with_lmstudio(
+        self,
+        texts: List[str],
+        source: str,
+        target: str,
+        context: str = "",
+    ) -> List[str]:
         batch_cfg = self._settings.batch
         if source and target and source.lower() == "zh" and target.lower() == "vi" and getattr(batch_cfg, "zh_vi_max_size", None) is not None:
             max_size = batch_cfg.zh_vi_max_size
         else:
             max_size = batch_cfg.max_size
+        max_size = max(1, max_size)
         max_chars = batch_cfg.max_chars
 
         outputs: List[str] = []
@@ -285,7 +432,7 @@ class TranslatorService:
                 char_count += len(next_text)
                 start += 1
 
-            batch_outputs = await self._call_lmstudio_batch(batch, source, target)
+            batch_outputs = await self._call_lmstudio_batch(batch, source, target, context=context)
             # #region agent log
             _debug_log("b5af83", "H4", "translator.py:_translate_with_lmstudio", "batch in/out counts", {"batch_start": start - len(batch), "batch_size": len(batch), "batch_output_len": len(batch_outputs)})
             # #endregion
@@ -293,7 +440,13 @@ class TranslatorService:
 
         return outputs
 
-    async def _call_lmstudio_batch(self, batch: List[str], source: str, target: str) -> List[str]:
+    async def _call_lmstudio_batch(
+        self,
+        batch: List[str],
+        source: str,
+        target: str,
+        context: str = "",
+    ) -> List[str]:
         model_name = self._settings.lmstudio.model.lower()
         endpoint_type = self._settings.lmstudio.endpoint_type
 
@@ -312,17 +465,88 @@ class TranslatorService:
 
         # If we are using a Translategemma model, use the custom payload.
         if "translategemma" in model_name:
-            return await self._call_translategemma(batch, source, target)
+            return await self._call_translategemma(batch, source, target, context=context)
+
+        # Gemma (non-Translategemma): raw input, dedicated prompt, post-process excess newlines.
+        if "gemma" in model_name and "translategemma" not in model_name:
+            return await self._call_gemma_3_12b(batch, source, target, context=context)
 
         if endpoint_type == "chat":
-            return await self._call_lmstudio_chat(batch, source, target)
+            return await self._call_lmstudio_chat(batch, source, target, context=context)
         if endpoint_type == "completion":
-            return await self._call_lmstudio_completion(batch, source, target)
+            return await self._call_lmstudio_completion(batch, source, target, context=context)
         # Fallback to chat if misconfigured.
-        return await self._call_lmstudio_chat(batch, source, target)
+        return await self._call_lmstudio_chat(batch, source, target, context=context)
 
-    async def _call_lmstudio_chat(self, batch: List[str], source: str, target: str) -> List[str]:
+    async def _call_gemma_3_12b(
+        self,
+        batch: List[str],
+        source: str,
+        target: str,
+        context: str = "",
+    ) -> List[str]:
+        """
+        Call Gemma-3-12b with raw user input only (no numbering/instructions in user message).
+        System prompt carries all instructions; post-process response to normalize excess newlines.
+        One request per batch item for 1:1 output mapping.
+        """
+        system_prompt = _build_system_prompt_gemma_3_12b(
+            self._settings, source, target
+        )
+        if context:
+            system_prompt = context.rstrip() + "\n\n" + system_prompt
+
+        gemma_cfg = getattr(self._settings, "gemma", None)
+        temperature = getattr(gemma_cfg, "temperature", 1.0) if gemma_cfg else 1.0
+        outputs: List[str] = []
+        for text in batch:
+            body = {
+                "model": self._settings.lmstudio.model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": text},
+                ],
+                "temperature": temperature,
+            }
+            print(
+                "[_call_gemma_3_12b] request",
+                json.dumps(
+                    {
+                        "url": f"{self._settings.lmstudio.base_url}/chat/completions",
+                        "model": self._settings.lmstudio.model,
+                    },
+                    ensure_ascii=False,
+                ),
+                file=sys.stderr,
+            )
+            resp = await self._client.post("/chat/completions", json=body)
+            resp.raise_for_status()
+            data = resp.json()
+            print(
+                "[_call_gemma_3_12b] response",
+                json.dumps(
+                    {"raw_preview": str(data)[:200]},
+                    ensure_ascii=False,
+                ),
+                file=sys.stderr,
+            )
+            content = data["choices"][0]["message"]["content"]
+            if not isinstance(content, str):
+                content = str(content)
+            content = _strip_source_arrow_target(content)
+            outputs.append(_normalize_excess_newlines(content))
+        return outputs
+
+    async def _call_lmstudio_chat(
+        self,
+        batch: List[str],
+        source: str,
+        target: str,
+        context: str = "",
+    ) -> List[str]:
         system_prompt = _build_system_prompt(self._settings, source, target)
+        if context:
+            system_prompt = context.rstrip() + "\n\n" + system_prompt
 
         if len(batch) == 1:
             user_content = batch[0]
@@ -384,8 +608,16 @@ class TranslatorService:
 
         return cleaned
 
-    async def _call_lmstudio_completion(self, batch: List[str], source: str, target: str) -> List[str]:
+    async def _call_lmstudio_completion(
+        self,
+        batch: List[str],
+        source: str,
+        target: str,
+        context: str = "",
+    ) -> List[str]:
         system_prompt = _build_system_prompt(self._settings, source, target)
+        if context:
+            system_prompt = context.rstrip() + "\n\n" + system_prompt
 
         if len(batch) == 1:
             user_content = batch[0]
@@ -439,12 +671,20 @@ class TranslatorService:
 
         return cleaned
 
-    async def _call_translategemma(self, batch: List[str], source: str, target: str) -> List[str]:
+    async def _call_translategemma(
+        self,
+        batch: List[str],
+        source: str,
+        target: str,
+        context: str = "",
+    ) -> List[str]:
         """
         Call Translategemma via LM Studio's OpenAI-compatible /chat/completions API,
         but use a custom content payload that carries source/target language codes.
         """
         system_prompt = _build_system_prompt(self._settings, source, target)
+        if context:
+            system_prompt = context.rstrip() + "\n\n" + system_prompt
 
         outputs: List[str] = []
         for text in batch:
@@ -529,6 +769,13 @@ def get_translator_service() -> TranslatorService:
     if _translator_service is None:
         settings = get_settings()
         cache = TranslationCache(settings)
-        _translator_service = TranslatorService(settings=settings, cache=cache)
+        session_store = SessionContextStore(
+            max_entries=settings.session.max_entries,
+            max_chars=settings.session.max_chars,
+            ttl_seconds=settings.session.ttl_seconds,
+        )
+        _translator_service = TranslatorService(
+            settings=settings, cache=cache, session_store=session_store
+        )
     return _translator_service
 

@@ -1,13 +1,55 @@
 import asyncio
+import dataclasses
 from unittest.mock import patch
 
 from translator import (
     _build_system_prompt,
     _extract_content_and_parts,
     _reassemble,
+    _slice_text_by_chars,
+    _strip_source_arrow_target,
     get_translator_service,
 )
 from config import get_settings
+
+
+def test_slice_text_by_chars_short():
+    """Text under limit returns one part."""
+    out = _slice_text_by_chars("short", 100)
+    assert out == ["short"]
+
+
+def test_slice_text_by_chars_splits_at_sentence():
+    """Long text splits at sentence boundary, not mid-word."""
+    text = "First sentence. Second sentence. Third sentence."
+    out = _slice_text_by_chars(text, 20)
+    assert len(out) >= 2
+    assert out[0].endswith(".")
+    assert "First sentence." == out[0]
+    assert out[1].strip().startswith("Second")
+
+
+def test_slice_text_by_chars_splits_at_newline():
+    """Long text splits at newline when present."""
+    text = "Line one\nLine two\nLine three"
+    out = _slice_text_by_chars(text, 12)
+    assert len(out) >= 2
+    assert out[0].endswith("\n") or "Line one" in out[0]
+
+
+def test_slice_text_by_chars_chinese_sentence_end():
+    """Chinese sentence end (。) is a break point."""
+    text = "这是第一句。这是第二句。"
+    out = _slice_text_by_chars(text, 8)
+    assert len(out) >= 2
+    assert out[0].endswith("。")
+
+
+def test_strip_source_arrow_target():
+    """Gemma 'source -> translation' format is stripped to translation only."""
+    assert _strip_source_arrow_target("相机抖动 -> Lắc máy ảnh") == "Lắc máy ảnh"
+    assert _strip_source_arrow_target("plain text") == "plain text"
+    assert _strip_source_arrow_target("no arrow here") == "no arrow here"
 
 
 def test_extract_content_and_parts_plain_text():
@@ -105,6 +147,11 @@ def test_translate_batch_markup_structure_preserved():
         from translator import TranslatorService
 
         settings = get_settings()
+        # Use a non-Gemma model so we exercise general pipeline (extract/reassemble, tag preservation).
+        settings = dataclasses.replace(
+            settings,
+            lmstudio=dataclasses.replace(settings.lmstudio, model="local-model"),
+        )
         cache = TranslationCache(settings)
         service = TranslatorService(settings=settings, cache=cache)
 

@@ -28,6 +28,21 @@ class CacheSettings:
 
 
 @dataclass
+class GemmaSettings:
+    max_slice_chars: int = 2000
+    max_retry_broken: int = 3
+    temperature: float = 1.0
+
+
+@dataclass
+class SessionSettings:
+    max_entries: int = 100
+    max_chars: int = 4000
+    ttl_seconds: int = 3600
+    inject_context_into_prompt: bool = False
+
+
+@dataclass
 class DefaultSettings:
     source_lang: str = "auto"
     target_lang: str = "en"
@@ -38,6 +53,8 @@ class Settings:
     lmstudio: LMStudioSettings
     batch: BatchSettings
     cache: CacheSettings
+    gemma: GemmaSettings
+    session: SessionSettings
     default: DefaultSettings
     prompts: dict | None = None
 
@@ -57,6 +74,8 @@ def get_settings() -> Settings:
     lm = data.get("lmstudio", {})
     batch = data.get("batch", {})
     cache = data.get("cache", {})
+    gemma = data.get("gemma", {})
+    session = data.get("session", {})
     default = data.get("default", {})
     prompts = data.get("prompts", {})
 
@@ -74,6 +93,17 @@ def get_settings() -> Settings:
     cache_settings = CacheSettings(
         persistent_file=str(cache.get("persistent_file", "cache.json")),
     )
+    gemma_settings = GemmaSettings(
+        max_slice_chars=int(gemma.get("max_slice_chars", 2000)),
+        max_retry_broken=int(gemma.get("max_retry_broken", 3)),
+        temperature=float(gemma.get("temperature", 1.0)),
+    )
+    session_settings = SessionSettings(
+        max_entries=int(session.get("max_entries", 100)),
+        max_chars=int(session.get("max_chars", 4000)),
+        ttl_seconds=int(session.get("ttl_seconds", 3600)),
+        inject_context_into_prompt=bool(session.get("inject_context_into_prompt", False)),
+    )
     default_settings = DefaultSettings(
         source_lang=str(default.get("source_lang", "auto")),
         target_lang=str(default.get("target_lang", "en")),
@@ -83,6 +113,8 @@ def get_settings() -> Settings:
         lmstudio=lm_settings,
         batch=batch_settings,
         cache=cache_settings,
+        gemma=gemma_settings,
+        session=session_settings,
         default=default_settings,
         prompts=prompts or {},
     )

@@ -8,7 +8,7 @@ client = TestClient(app)
 
 
 class FakeTranslator:
-    async def translate_batch(self, texts, source, target):
+    async def translate_batch(self, texts, source, target, session_id=None):
         # Echo back a simple deterministic "translation" for testing.
         from translator import TranslationResult
 

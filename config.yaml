@@ -1,6 +1,6 @@
 lmstudio:
   base_url: "http://localhost:1234/v1"
-  model: "google/gemma-3-4b"
+  model: "google/gemma-3-12b"
   endpoint_type: "chat"  # "chat" or "completion" (LM Studio interface type)
 
 batch:
@@ -13,6 +13,20 @@ batch:
 
 cache:
   persistent_file: "cache.json"
+
+# Gemma pipeline: slice large input, no cache validate, retry per part.
+gemma:
+  max_slice_chars: 2000
+  max_retry_broken: 3
+  temperature: 1.0
+
+# Optional: translation session context for consistency across requests (e.g. dialogue).
+session:
+  max_entries: 100
+  max_chars: 4000
+  ttl_seconds: 3600
+  # false = không chèn "Previous translations..." vào system prompt (tránh làm Gemma hiểu sai).
+  inject_context_into_prompt: false
 
 default:
   source_lang: "auto"
@@ -29,9 +43,10 @@ prompts:
     same number of lines in the same order, one translation per line, no line
     numbers.
     Rules: Output only the translation, no explanations. Preserve meaning and
-    tone. Use vocabulary natural to native speakers of {target_lang_name}.
+    tone. Use vocabulary natural to native speakers of {target_lang_name}. If
+    you receive a list of previous translations, keep terms and names consistent.
   zh-vi: >
-    Output only Vietnamese (Latin script). Never output Chinese characters.
+    Output only Vietnamese. Never output Chinese characters.
 
     Role: Professional Game Translator (Chinese to Vietnamese).
     Context: Xianxia/Wuxia game mods and UI.
@@ -67,3 +82,11 @@ prompts:
     Critical: Every single line must be translated. Never leave any line in Chinese.
     If the input has N lines (including empty lines), output must have exactly N
     lines in the same order. Empty input line → empty output line. No exceptions.
+    If you receive previous translations in this session, keep terms and names consistent.
+
+  # Dedicated prompt for Gemma (zh-vi): ngắn gọn, không nhắc lại, để model tuân thủ đúng.
+  gemma_3_12b_zh_vi: >
+    Hãy dịch văn bản từ tiếng Trung ra tiếng Việt, dùng Hán Việt cho tên người, sự vật, sự việc. Output: kết quả dịch cuối cùng, giữ nguyên cấu trúc của input, không thêm chú thích. Phải đảm bảo toàn bộ nội dung được dịch ra tiếng Việt, không tồn tại chữ Hán trong kết quả output.
+  # Fallback for gemma-3-12b with other language pairs.
+  gemma_3_12b_default: >
+    You are a professional translation engine. Translate the user message from {source_lang_name} to {target_lang_name}. Output only the translation, preserve structure. Do not output "source -> translation" format or any explanation; only the translated text.

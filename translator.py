@@ -22,8 +22,9 @@ def _debug_log(session_id: str, hypothesis_id: str, location: str, message: str,
 # #endregion
 
 from cache import TranslationCache
-from config import Settings, get_settings
+from config import Settings, ValidationSettings, get_settings
 from session_context import SessionContextStore
+from pipeline_translategemma import call_translategemma_with_json
 
 
 LANGUAGE_NAMES: Dict[str, str] = {
@@ -40,6 +41,31 @@ def _language_name_from_code(code: str) -> str:
 def _contains_chinese(text: str) -> bool:
     """True if text contains CJK Unified Ideographs (Chinese characters)."""
     return bool(re.search(r"[\u4e00-\u9fff]", text))
+
+
+def _is_translation_acceptable_zh_vi(text: str, validation: ValidationSettings) -> bool:
+    """
+    Whether a zh→vi translation result is acceptable (no retry).
+    Strict: any Chinese = not acceptable. Smart: accept if Chinese count or ratio below threshold.
+    Single O(n) pass; no AI.
+    """
+    if not text:
+        return True
+    mode = (validation.mode or "smart").lower()
+    if mode == "strict":
+        return not _contains_chinese(text)
+    # Smart: single pass count CJK codepoints
+    chinese_count = 0
+    for c in text:
+        if "\u4e00" <= c <= "\u9fff":
+            chinese_count += 1
+    total = len(text)
+    if total == 0:
+        return True
+    return (
+        chinese_count <= validation.max_chinese_chars
+        or (chinese_count / total) <= validation.max_chinese_ratio
+    )
 
 
 def _build_system_prompt(settings: Settings, source_lang: str, target_lang: str) -> str:
@@ -259,6 +285,9 @@ class TranslatorService:
             return []
         source_lang = source or self._settings.default.source_lang
         target_lang = target or self._settings.default.target_lang
+        model_name = (self._settings.lmstudio.model or "").lower()
+        if "translategemma" in model_name:
+            return await self._translate_batch_translategemma(texts, source_lang, target_lang, session_id)
         if _is_gemma_pipeline_model(self._settings):
             return await self._translate_batch_gemma(texts, source_lang, target_lang, session_id)
         return await self._translate_batch_general(texts, source_lang, target_lang, session_id)
@@ -298,7 +327,63 @@ class TranslatorService:
                 for _attempt in range(max_retry):
                     out_list = await self._call_gemma_3_12b([part], source_lang, target_lang, context=session_context)
                     last_out = out_list[0] if out_list else ""
-                    if is_zh_vi and _contains_chinese(last_out):
+                    if is_zh_vi and not _is_translation_acceptable_zh_vi(last_out, self._settings.validation):
+                        continue
+                    break
+                translated_parts.append(last_out)
+            full = "\n".join(translated_parts)
+            full = _normalize_excess_newlines(full)
+            self._cache.set_many({key: full})
+            if session_id and self._session_store:
+                self._session_store.append(session_id, [(text, full)])
+            results.append(TranslationResult(text=full, detected_source_language=detected))
+        return results
+
+    async def _translate_batch_translategemma(
+        self,
+        texts: List[str],
+        source_lang: str,
+        target_lang: str,
+        session_id: Optional[str],
+    ) -> List[TranslationResult]:
+        """Translategemma pipeline: cache no validate, slice, translate with JSON payload, retry, post-process."""
+        detected = source_lang if source_lang != "auto" else None
+        session_context = ""
+        if session_id and self._session_store and getattr(self._settings.session, "inject_context_into_prompt", False):
+            session_context = self._session_store.get_context(session_id)
+        gemma_cfg = getattr(self._settings, "gemma", None)
+        max_slice = getattr(gemma_cfg, "max_slice_chars", 2000) if gemma_cfg else 2000
+        max_retry = getattr(gemma_cfg, "max_retry_broken", 3) if gemma_cfg else 3
+        is_zh_vi = source_lang and target_lang and source_lang.lower() == "zh" and target_lang.lower() == "vi"
+        results: List[TranslationResult] = []
+        for text in texts:
+            key = self._cache.make_key(source_lang, target_lang, text)
+            cached = self._cache.get_many([key])
+            if key in cached:
+                results.append(TranslationResult(text=cached[key], detected_source_language=detected))
+                continue
+            if not text.strip():
+                results.append(TranslationResult(text=text, detected_source_language=detected))
+                continue
+            parts = _slice_text_by_chars(text, max_slice)
+            if not parts:
+                parts = [text]
+            translated_parts: List[str] = []
+            for part in parts:
+                last_out = ""
+                for _attempt in range(max_retry):
+                    out_list = await call_translategemma_with_json(
+                        self._client,
+                        self._settings,
+                        [part],
+                        source_lang,
+                        target_lang,
+                        session_context,
+                        normalize_newlines_fn=_normalize_excess_newlines,
+                        strip_source_arrow_fn=_strip_source_arrow_target,
+                    )
+                    last_out = out_list[0] if out_list else ""
+                    if is_zh_vi and not _is_translation_acceptable_zh_vi(last_out, self._settings.validation):
                         continue
                     break
                 translated_parts.append(last_out)
@@ -353,7 +438,7 @@ class TranslatorService:
         for i in range(len(all_segments)):
             if keys[i] not in cached:
                 missing_indices.append(i)
-            elif is_zh_vi and _contains_chinese(cached.get(keys[i], "")):
+            elif is_zh_vi and not _is_translation_acceptable_zh_vi(cached.get(keys[i], ""), self._settings.validation):
                 broken_keys.append(keys[i])
                 missing_indices.append(i)
         if broken_keys:
@@ -371,7 +456,7 @@ class TranslatorService:
             retry_list: List[Tuple[int, str]] = [
                 (idx, all_segments[idx])
                 for j, idx in enumerate(missing_indices)
-                if is_zh_vi and _contains_chinese(new_translations[j])
+                if is_zh_vi and not _is_translation_acceptable_zh_vi(new_translations[j], self._settings.validation)
             ]
             for _attempt in range(max_retry):
                 if not retry_list:
@@ -383,13 +468,13 @@ class TranslatorService:
                 next_retry: List[Tuple[int, str]] = []
                 for k, (idx, _seg) in enumerate(retry_list):
                     all_translations[idx] = retry_trans[k]
-                    if is_zh_vi and _contains_chinese(retry_trans[k]):
+                    if is_zh_vi and not _is_translation_acceptable_zh_vi(retry_trans[k], self._settings.validation):
                         next_retry.append((idx, all_segments[idx]))
                 retry_list = next_retry
             cache_updates = {
                 keys[idx]: all_translations[idx]
                 for idx in missing_indices
-                if not (is_zh_vi and _contains_chinese(all_translations[idx]))
+                if not (is_zh_vi and not _is_translation_acceptable_zh_vi(all_translations[idx], self._settings.validation))
             }
             self._cache.set_many(cache_updates)
             if session_id and self._session_store:
@@ -463,9 +548,7 @@ class TranslatorService:
             file=sys.stderr,
         )
 
-        # If we are using a Translategemma model, use the custom payload.
-        if "translategemma" in model_name:
-            return await self._call_translategemma(batch, source, target, context=context)
+        # Translategemma uses its own pipeline (_translate_batch_translategemma), not _call_lmstudio_batch.
 
         # Gemma (non-Translategemma): raw input, dedicated prompt, post-process excess newlines.
         if "gemma" in model_name and "translategemma" not in model_name:
@@ -670,96 +753,6 @@ class TranslatorService:
                 cleaned = cleaned[: len(batch)]
 
         return cleaned
-
-    async def _call_translategemma(
-        self,
-        batch: List[str],
-        source: str,
-        target: str,
-        context: str = "",
-    ) -> List[str]:
-        """
-        Call Translategemma via LM Studio's OpenAI-compatible /chat/completions API,
-        but use a custom content payload that carries source/target language codes.
-        """
-        system_prompt = _build_system_prompt(self._settings, source, target)
-        if context:
-            system_prompt = context.rstrip() + "\n\n" + system_prompt
-
-        outputs: List[str] = []
-        for text in batch:
-            # Custom payload: include source/target language codes in the content block.
-            payload = {
-                "model": self._settings.lmstudio.model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": system_prompt,
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "input_text",
-                                "text": text,
-                                "source_lang_code": source,
-                                "target_lang_code": target,
-                            }
-                        ],
-                    },
-                ],
-                "temperature": 0.1,
-                "max_tokens": 500,
-            }
-
-            print(
-                "[_call_translategemma] request",
-                json.dumps(
-                    {
-                        "url": f"{self._settings.lmstudio.base_url}/chat/completions",
-                        "model": self._settings.lmstudio.model,
-                        "source_lang": source,
-                        "target_lang": target,
-                    },
-                    ensure_ascii=False,
-                ),
-                file=sys.stderr,
-            )
-
-            resp = await self._client.post("/chat/completions", json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            print(
-                "[_call_translategemma] response",
-                json.dumps(
-                    {"raw_preview": str(data)[:200]},
-                    ensure_ascii=False,
-                ),
-                file=sys.stderr,
-            )
-
-            # If LM Studio returns an error object, surface it instead of caching it as a translation.
-            if isinstance(data, dict) and "error" in data:
-                raise RuntimeError(f"LM Studio Translategemma error: {data['error']}")
-
-            # Expect OpenAI-style chat completion: choices[0].message.content
-            try:
-                content = data["choices"][0]["message"]["content"]
-                if isinstance(content, str):
-                    generated = content
-                else:
-                    # If content is a list of blocks, concatenate their text.
-                    generated = " ".join(
-                        block.get("text", "") for block in content if isinstance(block, dict)
-                    )
-            except (KeyError, IndexError, TypeError):
-                # If the shape differs, fall back to stringifying the whole response.
-                generated = str(data)
-
-            outputs.append(generated)
-
-        return outputs
-
 
 _translator_service: Optional[TranslatorService] = None
 

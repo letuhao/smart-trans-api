@@ -49,6 +49,13 @@ class DefaultSettings:
 
 
 @dataclass
+class ValidationSettings:
+    mode: str = "smart"  # "strict" | "smart"
+    max_chinese_ratio: float = 0.05
+    max_chinese_chars: int = 5
+
+
+@dataclass
 class Settings:
     lmstudio: LMStudioSettings
     batch: BatchSettings
@@ -56,6 +63,7 @@ class Settings:
     gemma: GemmaSettings
     session: SessionSettings
     default: DefaultSettings
+    validation: ValidationSettings
     prompts: dict | None = None
 
 
@@ -77,6 +85,7 @@ def get_settings() -> Settings:
     gemma = data.get("gemma", {})
     session = data.get("session", {})
     default = data.get("default", {})
+    validation = data.get("validation", {})
     prompts = data.get("prompts", {})
 
     lm_settings = LMStudioSettings(
@@ -108,6 +117,11 @@ def get_settings() -> Settings:
         source_lang=str(default.get("source_lang", "auto")),
         target_lang=str(default.get("target_lang", "en")),
     )
+    validation_settings = ValidationSettings(
+        mode=str(validation.get("mode", "smart")),
+        max_chinese_ratio=float(validation.get("max_chinese_ratio", 0.05)),
+        max_chinese_chars=int(validation.get("max_chinese_chars", 5)),
+    )
 
     return Settings(
         lmstudio=lm_settings,
@@ -116,6 +130,7 @@ def get_settings() -> Settings:
         gemma=gemma_settings,
         session=session_settings,
         default=default_settings,
+        validation=validation_settings,
         prompts=prompts or {},
     )
 

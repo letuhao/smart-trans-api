@@ -111,7 +111,8 @@ async def translate_v2_get(
         # Google-style ?text=... (possibly multi-line, %0A -> '\n').
         # Gemma-3-12b: pass raw text as one item (no line split) so model gets full context.
         settings = get_settings()
-        if settings.lmstudio.model and "gemma" in settings.lmstudio.model.lower() and "translategemma" not in settings.lmstudio.model.lower():
+        # Gemma and Translategemma: pass raw text as one item (no line split).
+        if settings.lmstudio.model and ("gemma" in settings.lmstudio.model.lower() or "translategemma" in settings.lmstudio.model.lower()):
             texts = [text]
         else:
             texts = [line for line in text.splitlines() if line.strip()]

@@ -1,6 +1,6 @@
 lmstudio:
   base_url: "http://localhost:1234/v1"
-  model: "google/gemma-3-12b"
+  model: "translategemma-12b-it"
   endpoint_type: "chat"  # "chat" or "completion" (LM Studio interface type)
 
 batch:
@@ -27,6 +27,13 @@ session:
   ttl_seconds: 3600
   # false = không chèn "Previous translations..." vào system prompt (tránh làm Gemma hiểu sai).
   inject_context_into_prompt: false
+
+# Zh→vi result validation: strict (any Chinese = retry) or smart (accept by count/ratio).
+validation:
+  mode: "smart"   # "strict" | "smart"; default smart
+  # Smart mode only:
+  max_chinese_ratio: 0.05   # accept if Chinese chars ≤ 5% of length
+  max_chinese_chars: 5      # or accept if ≤ 5 Chinese chars total
 
 default:
   source_lang: "auto"
@@ -90,3 +97,9 @@ prompts:
   # Fallback for gemma-3-12b with other language pairs.
   gemma_3_12b_default: >
     You are a professional translation engine. Translate the user message from {source_lang_name} to {target_lang_name}. Output only the translation, preserve structure. Do not output "source -> translation" format or any explanation; only the translated text.
+
+  # Translategemma pipeline (zh-vi): input sent as JSON; prompt dedicated.
+  translategemma_zh_vi: >
+    Dịch tiếng Trung ra Tiếng Việt, đảm bảo toàn bộ Hán tự đều được dịch. Lưu ý: bạn không thêm chú thích, phải giữ nguyên input format.
+  translategemma_default: >
+    Translate from {source_lang_name} to {target_lang_name}. Output only the translation, preserve structure. No explanations.

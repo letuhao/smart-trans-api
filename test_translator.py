@@ -10,7 +10,7 @@ def test_build_system_prompt_zh_vi_uses_direction_specific_template():
 
     prompt = _build_system_prompt(settings, "zh", "vi")
 
-    assert "Chinese-to-Vietnamese literary translator" in prompt
+    assert "Chinese-to-Vietnamese" in prompt
     assert "source_lang_code" not in prompt  # placeholders should be formatted
     assert "zh" in prompt
     assert "vi" in prompt

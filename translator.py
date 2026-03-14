@@ -178,20 +178,16 @@ class TranslatorService:
     async def _call_lmstudio_chat(self, batch: List[str], source: str, target: str) -> List[str]:
         system_prompt = _build_system_prompt(self._settings, source, target)
 
-        prompt_lines = [
-            "Translate each of the following lines in order.",
-            "Return only the translated lines in the same order, separated by newlines.",
-            "",
-        ]
-        for idx, text in enumerate(batch, start=1):
-            prompt_lines.append(f"{idx}. {text}")
-        prompt = "\n".join(prompt_lines)
+        if len(batch) == 1:
+            user_content = batch[0]
+        else:
+            user_content = "\n".join(f"{i}. {t}" for i, t in enumerate(batch, start=1))
 
         body = {
             "model": self._settings.lmstudio.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
+                {"role": "user", "content": user_content},
             ],
         }
 
@@ -239,15 +235,11 @@ class TranslatorService:
     async def _call_lmstudio_completion(self, batch: List[str], source: str, target: str) -> List[str]:
         system_prompt = _build_system_prompt(self._settings, source, target)
 
-        prompt_lines = [
-            system_prompt,
-            "",
-            "Text to translate (one line per item):",
-            "",
-        ]
-        for idx, text in enumerate(batch, start=1):
-            prompt_lines.append(f"{idx}. {text}")
-        prompt = "\n".join(prompt_lines)
+        if len(batch) == 1:
+            user_content = batch[0]
+        else:
+            user_content = "\n".join(f"{i}. {t}" for i, t in enumerate(batch, start=1))
+        prompt = system_prompt + "\n\n" + user_content
 
         body = {
             "model": self._settings.lmstudio.model,

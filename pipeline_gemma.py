@@ -8,6 +8,7 @@ import re
 from typing import TYPE_CHECKING, Awaitable, Callable, List, Optional, Tuple
 
 from config import Settings
+from language_resolver import resolve_lang
 
 if TYPE_CHECKING:
     from cache import TranslationCache
@@ -16,7 +17,7 @@ if TYPE_CHECKING:
 from pipeline_general import _contains_chinese, _is_translation_acceptable_zh_vi
 
 
-# For Gemma system prompt template formatting (avoid circular import with translator).
+# For Gemma system prompt template formatting (avoid circular import with translator) and default names.
 _LANGUAGE_NAMES: dict[str, str] = {
     "zh": "Chinese",
     "vi": "Vietnamese",
@@ -131,6 +132,38 @@ def _slice_text_by_chars(text: str, max_chars: int) -> List[str]:
     return parts if parts else [text]
 
 
+# Gemma v2: default user prompt template when not provided in config.
+_DEFAULT_V2_USER_PROMPT = (
+    "<start_of_turn>user\n"
+    "You are a professional {SOURCE_LANG} ({SOURCE_CODE}) to {TARGET_LANG} ({TARGET_CODE}) translator. "
+    "Your goal is to accurately convey the meaning and nuances of the original {SOURCE_LANG} text while "
+    "adhering to {TARGET_LANG} grammar, vocabulary, and cultural sensitivities.\n"
+    "Produce only the {TARGET_LANG} translation, without any additional explanations or commentary. "
+    "Please translate the following {SOURCE_LANG} text into {TARGET_LANG}:\n\n\n"
+    "{user_input}<end_of_turn>"
+)
+
+
+def _build_gemma_v2_user_message(
+    settings: Settings, source_lang: str, target_lang: str, text: str
+) -> str:
+    """
+    Build user message for Gemma v2 using template from config (gemma_v2_user_prompt) or default.
+    Uses language_resolver to fill SOURCE_LANG/SOURCE_CODE and TARGET_LANG/TARGET_CODE.
+    """
+    templates = settings.prompts or {}
+    template = templates.get("gemma_v2_user_prompt") or _DEFAULT_V2_USER_PROMPT
+    source_name, source_code = resolve_lang(source_lang or "", "Chinese", "zh-Hans")
+    target_name, target_code = resolve_lang(target_lang or "", "Vietnamese", "vi-VN")
+    return template.format(
+        SOURCE_LANG=source_name,
+        SOURCE_CODE=source_code,
+        TARGET_LANG=target_name,
+        TARGET_CODE=target_code,
+        user_input=text,
+    )
+
+
 async def translate_batch_gemma(
     texts: List[str],
     source_lang: str,
@@ -182,6 +215,77 @@ async def translate_batch_gemma(
             for _attempt in range(max_retry):
                 out_list = await call_gemma_3_12b(
                     [part], source_lang, target_lang, session_context
+                )
+                last_out = out_list[0] if out_list else ""
+                if is_zh_vi and not _is_translation_acceptable_zh_vi(
+                    last_out, settings.validation
+                ):
+                    continue
+                break
+            translated_parts.append(last_out)
+        full = "\n".join(translated_parts)
+        full = _normalize_excess_newlines(full)
+        cache.set_many({key: full})
+        if session_id and session_store:
+            session_store.append(session_id, [(text, full)])
+        results.append((full, detected))
+    return results
+
+
+async def translate_batch_gemma_v2(
+    texts: List[str],
+    source_lang: str,
+    target_lang: str,
+    session_id: Optional[str],
+    settings: Settings,
+    cache: "TranslationCache",
+    session_store: Optional["SessionContextStore"],
+    call_gemma_3_12b_v2: Callable[
+        [List[str], str, str, str], Awaitable[List[str]]
+    ],
+) -> List[Tuple[str, Optional[str]]]:
+    """
+    Gemma-3-12b pipeline v2: same slice/cache/retry logic as v1, but user content is a
+    prompt template with SOURCE/TARGET placeholders and optional system prompt handled
+    in the callback. Returns list of (translated_text, detected_source_language).
+    """
+    detected = source_lang if source_lang != "auto" else None
+    session_context = ""
+    if session_id and session_store and getattr(
+        settings.session, "inject_context_into_prompt", False
+    ):
+        session_context = session_store.get_context(session_id)
+    gemma_cfg = getattr(settings, "gemma", None)
+    max_slice = getattr(gemma_cfg, "max_slice_chars", 2000) if gemma_cfg else 2000
+    max_retry = getattr(gemma_cfg, "max_retry_broken", 3) if gemma_cfg else 3
+    is_zh_vi = (
+        source_lang
+        and target_lang
+        and source_lang.lower() == "zh"
+        and target_lang.lower() == "vi"
+    )
+    results: List[Tuple[str, Optional[str]]] = []
+    for text in texts:
+        key = cache.make_key(source_lang, target_lang, text)
+        cached = cache.get_many([key])
+        if key in cached:
+            results.append((cached[key], detected))
+            continue
+        if not text.strip():
+            results.append((text, detected))
+            continue
+        parts = _slice_text_by_chars(text, max_slice)
+        if not parts:
+            parts = [text]
+        translated_parts: List[str] = []
+        for part in parts:
+            user_content = _build_gemma_v2_user_message(
+                settings, source_lang, target_lang, part
+            )
+            last_out = ""
+            for _attempt in range(max_retry):
+                out_list = await call_gemma_3_12b_v2(
+                    [user_content], source_lang, target_lang, session_context
                 )
                 last_out = out_list[0] if out_list else ""
                 if is_zh_vi and not _is_translation_acceptable_zh_vi(

@@ -20,6 +20,10 @@ gemma:
   max_slice_chars: 2000
   max_retry_broken: 3
   temperature: 1.0
+  # Gemma v2: versioned pipeline with optional system prompt and user prompt template.
+  version: v2
+  system_prompt: ""   # if empty, do not send system message; when non-empty, session context is injected here
+  post_process: false   # when false (default), accept raw result; when true, allow extended post-process
 
 # Translategemma pipeline: how to send user input to the model.
 translategemma:
@@ -174,3 +178,12 @@ prompts:
     Translate the user input from {source_lang_name} to {target_lang_name}. Output only the translation, no questions, no explanations, no notes. Preserve input structure.
   # User message prefix for zh-vi (prepended before raw input).
   deepseek_user_prefix_zh_vi: "Hãy dịch ra tiếng Việt với nội dung bên dưới, không giải thích, dùng từ Hán-Việt để thể hiện tên riêng của sự vật, sự việc, tên người, địa danh:\n"
+
+  # Gemma v2: default user prompt (all pairs); placeholders filled from language_resolver.
+  gemma_v2_user_prompt: >
+    <start_of_turn>user
+    You are a professional {SOURCE_LANG} ({SOURCE_CODE}) to {TARGET_LANG} ({TARGET_CODE}) translator. Your goal is to accurately convey the meaning and nuances of the original {SOURCE_LANG} text while adhering to {TARGET_LANG} grammar, vocabulary, and cultural sensitivities.
+    Produce only the {TARGET_LANG} translation, without any additional explanations or commentary. Please translate the following {SOURCE_LANG} text into {TARGET_LANG}:
+
+
+    {user_input}<end_of_turn>

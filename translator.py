@@ -35,6 +35,7 @@ from pipeline_gemma import (
     _slice_text_by_chars,
     _strip_source_arrow_target,
     translate_batch_gemma,
+    translate_batch_gemma_v2,
 )
 from pipeline_deepseek import (
     build_system_prompt_deepseek,
@@ -139,17 +140,30 @@ class TranslatorService:
         target_lang: str,
         session_id: Optional[str],
     ) -> List[TranslationResult]:
-        """Delegate to Gemma pipeline; wrap (text, detected) results as TranslationResult."""
-        raw = await translate_batch_gemma(
-            texts=texts,
-            source_lang=source_lang,
-            target_lang=target_lang,
-            session_id=session_id,
-            settings=self._settings,
-            cache=self._cache,
-            session_store=self._session_store,
-            call_gemma_3_12b=self._call_gemma_3_12b,
-        )
+        """Delegate to Gemma pipeline v1 or v2 (by config); wrap (text, detected) results as TranslationResult."""
+        version = getattr(self._settings.gemma, "version", "v2").lower()
+        if version == "v2":
+            raw = await translate_batch_gemma_v2(
+                texts=texts,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                session_id=session_id,
+                settings=self._settings,
+                cache=self._cache,
+                session_store=self._session_store,
+                call_gemma_3_12b_v2=self._call_gemma_3_12b_v2,
+            )
+        else:
+            raw = await translate_batch_gemma(
+                texts=texts,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                session_id=session_id,
+                settings=self._settings,
+                cache=self._cache,
+                session_store=self._session_store,
+                call_gemma_3_12b=self._call_gemma_3_12b,
+            )
         return [
             TranslationResult(text=t, detected_source_language=d) for t, d in raw
         ]
@@ -317,8 +331,11 @@ class TranslatorService:
 
         # Translategemma uses its own pipeline (_translate_batch_translategemma), not _call_lmstudio_batch.
 
-        # Gemma (non-Translategemma): raw input, dedicated prompt, post-process excess newlines.
+        # Gemma (non-Translategemma): use versioned pipeline callback.
         if "gemma" in model_name and "translategemma" not in model_name:
+            version = getattr(self._settings.gemma, "version", "v2").lower()
+            if version == "v2":
+                return await self._call_gemma_3_12b_v2(batch, source, target, context=context)
             return await self._call_gemma_3_12b(batch, source, target, context=context)
 
         # DeepSeek: system + user prompt (zh→vi Vietnamese instructions), one request per item.
@@ -387,6 +404,68 @@ class TranslatorService:
             content = data["choices"][0]["message"]["content"]
             if not isinstance(content, str):
                 content = str(content)
+            content = _strip_source_arrow_target(content)
+            outputs.append(_normalize_excess_newlines(content))
+        return outputs
+
+    async def _call_gemma_3_12b_v2(
+        self,
+        batch: List[str],
+        source: str,
+        target: str,
+        context: str = "",
+    ) -> List[str]:
+        """
+        Call Gemma-3-12b for v2 pipeline: user content is already a prompt template
+        (<start_of_turn>user ... {user_input}<end_of_turn>). Optional system prompt
+        comes from gemma.system_prompt; session context is injected into system when present.
+        """
+        gemma_cfg = getattr(self._settings, "gemma", None)
+        system_prompt = ""
+        if gemma_cfg:
+            system_prompt = getattr(gemma_cfg, "system_prompt", "") or ""
+            system_prompt = system_prompt.strip()
+        if system_prompt and context:
+            system_prompt = context.rstrip() + "\n\n" + system_prompt
+
+        temperature = getattr(gemma_cfg, "temperature", 1.0) if gemma_cfg else 1.0
+        outputs: List[str] = []
+        for text in batch:
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": text})
+            body = {
+                "model": self._settings.lmstudio.model,
+                "messages": messages,
+                "temperature": temperature,
+            }
+            print(
+                "[_call_gemma_3_12b_v2] request",
+                json.dumps(
+                    {
+                        "url": f"{self._settings.lmstudio.base_url}/chat/completions",
+                        "model": self._settings.lmstudio.model,
+                    },
+                    ensure_ascii=False,
+                ),
+                file=sys.stderr,
+            )
+            resp = await self._client.post("/chat/completions", json=body)
+            resp.raise_for_status()
+            data = resp.json()
+            print(
+                "[_call_gemma_3_12b_v2] response",
+                json.dumps(
+                    {"raw_preview": str(data)[:200]},
+                    ensure_ascii=False,
+                ),
+                file=sys.stderr,
+            )
+            content = data["choices"][0]["message"]["content"]
+            if not isinstance(content, str):
+                content = str(content)
+            # Minimal post-process: strip optional source->target arrow and normalize newlines.
             content = _strip_source_arrow_target(content)
             outputs.append(_normalize_excess_newlines(content))
         return outputs

@@ -32,6 +32,12 @@ class GemmaSettings:
     max_slice_chars: int = 2000
     max_retry_broken: int = 3
     temperature: float = 1.0
+    # Gemma pipeline versioning: v1 = legacy system+raw user; v2 = user prompt template.
+    version: str = "v2"  # "v1" | "v2"
+    # Optional system prompt for v2; if empty, no system message is sent.
+    system_prompt: str = ""
+    # When False (default), accept raw result (minimal extract/normalize only). When True, optional extended post-process can be applied.
+    post_process: bool = False
 
 
 @dataclass
@@ -118,6 +124,9 @@ def get_settings() -> Settings:
         max_slice_chars=int(gemma.get("max_slice_chars", 2000)),
         max_retry_broken=int(gemma.get("max_retry_broken", 3)),
         temperature=float(gemma.get("temperature", 1.0)),
+        version=str(gemma.get("version", "v2")).lower(),
+        system_prompt=str(gemma.get("system_prompt", "")).strip(),
+        post_process=bool(gemma.get("post_process", False)),
     )
     translategemma_settings = TranslategemmaSettings(
         version=str(translategemma.get("version", "v2")).lower(),

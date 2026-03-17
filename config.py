@@ -36,7 +36,10 @@ class GemmaSettings:
 
 @dataclass
 class TranslategemmaSettings:
-    user_input_format: str = "json"  # "json" | "raw"
+    version: str = "v2"  # "v1" | "v2"
+    system_prompt: str = ""  # v2: if empty, do not send system message
+    post_process: bool = False  # v2: when True, run full post-process chain
+    user_input_format: str = "json"  # "json" | "raw" (v1)
 
 
 @dataclass
@@ -117,6 +120,9 @@ def get_settings() -> Settings:
         temperature=float(gemma.get("temperature", 1.0)),
     )
     translategemma_settings = TranslategemmaSettings(
+        version=str(translategemma.get("version", "v2")).lower(),
+        system_prompt=str(translategemma.get("system_prompt", "")).strip(),
+        post_process=bool(translategemma.get("post_process", False)),
         user_input_format=str(translategemma.get("user_input_format", "json")).lower(),
     )
     session_settings = SessionSettings(

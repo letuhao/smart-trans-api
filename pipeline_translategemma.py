@@ -1,6 +1,7 @@
 """
 Translategemma pipeline: prompt builder and API call with JSON user content.
 Input format: user message content = {"role": "user", "source_lang_code": "...", "target_lang_code": "...", "text": "..."}.
+V2: user prompt template (default or zh_vi), optional system prompt, post_process flag.
 """
 from __future__ import annotations
 
@@ -13,6 +14,8 @@ if TYPE_CHECKING:
     from config import Settings
 
 import httpx
+
+from language_resolver import resolve_lang
 
 
 def _language_name_from_code(code: str) -> str:
@@ -368,6 +371,144 @@ async def call_translategemma_with_json(
         generated = _normalize_ai_added_punctuation(generated, text)
         generated = strip_source_arrow_fn(generated)
         generated = normalize_newlines_fn(generated)
+        outputs.append(generated)
+
+    return outputs
+
+
+# V2 default user prompt when not in config (placeholders: SOURCE_LANG, SOURCE_CODE, TARGET_LANG, TARGET_CODE, user_input).
+_DEFAULT_V2_USER_PROMPT = """You are a professional {SOURCE_LANG} ({SOURCE_CODE}) to {TARGET_LANG} ({TARGET_CODE}) translator. Your goal is to accurately convey the meaning and nuances of the original {SOURCE_LANG} text while adhering to {TARGET_LANG} grammar, vocabulary, and cultural sensitivities.
+Produce only the {TARGET_LANG} translation, without any additional explanations or commentary. Please translate the following {SOURCE_LANG} text into {TARGET_LANG}:
+
+ {user_input}"""
+
+# V2 zh-vi user prompt when not in config.
+_DEFAULT_V2_USER_PROMPT_ZH_VI = """You are a professional Chinese (zh-Hans) to Vietnamese (vi-VN) translator. Your goal is to accurately convey the meaning and nuances of the original Chinese text while adhering to Vietnamese grammar, vocabulary, and cultural sensitivities.
+
+Specific Requirement for Proper Nouns: All proper nouns (including people, places, things, events, and objects) must be translated using their standard Sino-Vietnamese (Hán-Việt) equivalents. Do not use Pinyin or literal modern translations.
+
+Preserve original input format and structure.
+
+Produce only the Vietnamese translation, without any additional explanations or commentary. Please translate the following Chinese text into Vietnamese:
+
+ {user_input}"""
+
+
+def _build_v2_user_message(
+    settings: "Settings", source: str, target: str, text: str
+) -> str:
+    """Build user message for v2: zh-vi template or default template with resolver."""
+    source_lower = (source or "").lower()
+    target_lower = (target or "").lower()
+    templates = settings.prompts or {}
+    if source_lower == "zh" and target_lower == "vi":
+        template = templates.get("translategemma_v2_user_prompt_zh_vi") or _DEFAULT_V2_USER_PROMPT_ZH_VI
+        return template.format(user_input=text)
+    template = templates.get("translategemma_v2_user_prompt") or _DEFAULT_V2_USER_PROMPT
+    source_name, source_code = resolve_lang(source, "Chinese", "zh-Hans")
+    target_name, target_code = resolve_lang(target, "Vietnamese", "vi-VN")
+    return template.format(
+        SOURCE_LANG=source_name,
+        SOURCE_CODE=source_code,
+        TARGET_LANG=target_name,
+        TARGET_CODE=target_code,
+        user_input=text,
+    )
+
+
+async def call_translategemma_v2(
+    client: httpx.AsyncClient,
+    settings: "Settings",
+    batch: List[str],
+    source: str,
+    target: str,
+    context: str = "",
+    *,
+    normalize_newlines_fn: Callable[[str], str],
+    strip_source_arrow_fn: Callable[[str], str],
+) -> List[str]:
+    """
+    Translategemma v2: optional system prompt (when empty, no system message; when present, session context injected).
+    User message = template (zh_vi or default with SOURCE/TARGET from language_resolver) + user_input.
+    When post_process is False (default): accept raw result (minimal extract only). When True: full post-process chain.
+    """
+    translategemma_cfg = getattr(settings, "translategemma", None)
+    system_prompt = (
+        getattr(translategemma_cfg, "system_prompt", "") or ""
+    ).strip()
+    post_process = getattr(translategemma_cfg, "post_process", False)
+    if system_prompt:
+        if context:
+            system_prompt = context.rstrip() + "\n\n" + system_prompt
+        messages_include_system = True
+    else:
+        messages_include_system = False
+
+    gemma_cfg = getattr(settings, "gemma", None)
+    temperature = getattr(gemma_cfg, "temperature", 0.1) if gemma_cfg else 0.1
+
+    outputs: List[str] = []
+    for text in batch:
+        user_content = _build_v2_user_message(settings, source, target, text)
+        messages: List[dict] = []
+        if messages_include_system:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_content})
+
+        payload = {
+            "model": settings.lmstudio.model,
+            "messages": messages,
+            "temperature": temperature,
+        }
+
+        print(
+            "[call_translategemma_v2] request",
+            json.dumps(
+                {
+                    "url": f"{settings.lmstudio.base_url}/chat/completions",
+                    "model": settings.lmstudio.model,
+                    "source_lang": source,
+                    "target_lang": target,
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+
+        resp = await client.post("/chat/completions", json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+
+        print(
+            "[call_translategemma_v2] response",
+            json.dumps({"raw_preview": str(data)[:200]}, ensure_ascii=False),
+            file=sys.stderr,
+        )
+
+        if isinstance(data, dict) and "error" in data:
+            raise RuntimeError(f"LM Studio Translategemma error: {data['error']}")
+
+        try:
+            content = data["choices"][0]["message"]["content"]
+            if isinstance(content, str):
+                raw = content
+            else:
+                raw = " ".join(
+                    block.get("text", "") for block in content if isinstance(block, dict)
+                )
+            generated = _extract_translation_from_content(raw)
+        except (KeyError, IndexError, TypeError):
+            generated = _extract_translation_from_content(str(data))
+
+        if post_process:
+            generated = _take_first_option(generated)
+            generated = _strip_explanation_if_length_mismatch(generated, text)
+            generated = _normalize_ai_added_punctuation(generated, text)
+            generated = strip_source_arrow_fn(generated)
+            generated = normalize_newlines_fn(generated)
+        else:
+            generated = generated.strip()
+
         outputs.append(generated)
 
     return outputs

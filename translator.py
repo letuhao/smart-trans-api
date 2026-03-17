@@ -24,7 +24,7 @@ def _debug_log(session_id: str, hypothesis_id: str, location: str, message: str,
 from cache import TranslationCache
 from config import Settings, ValidationSettings, get_settings
 from session_context import SessionContextStore
-from pipeline_translategemma import call_translategemma_with_json
+from pipeline_translategemma import call_translategemma_v2, call_translategemma_with_json
 from pipeline_general import (
     _is_translation_acceptable_zh_vi,
     translate_batch_general,
@@ -183,11 +183,13 @@ class TranslatorService:
         target_lang: str,
         session_id: Optional[str],
     ) -> List[TranslationResult]:
-        """Translategemma pipeline: cache no validate, slice, translate with JSON payload, retry, post-process."""
+        """Translategemma pipeline: v1 or v2 by config; cache, slice, retry, post-process (v1 or when v2 post_process=True)."""
         detected = source_lang if source_lang != "auto" else None
         session_context = ""
         if session_id and self._session_store and getattr(self._settings.session, "inject_context_into_prompt", False):
             session_context = self._session_store.get_context(session_id)
+        version = getattr(self._settings.translategemma, "version", "v2").lower()
+        call_translategemma = call_translategemma_v2 if version == "v2" else call_translategemma_with_json
         gemma_cfg = getattr(self._settings, "gemma", None)
         max_slice = getattr(gemma_cfg, "max_slice_chars", 2000) if gemma_cfg else 2000
         max_retry = getattr(gemma_cfg, "max_retry_broken", 3) if gemma_cfg else 3
@@ -209,7 +211,7 @@ class TranslatorService:
             for part in parts:
                 last_out = ""
                 for _attempt in range(max_retry):
-                    out_list = await call_translategemma_with_json(
+                    out_list = await call_translategemma(
                         self._client,
                         self._settings,
                         [part],
